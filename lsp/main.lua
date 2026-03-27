@@ -237,15 +237,13 @@ function preInsertNewline(bp)
 		local file, line, character = data:match("(./[^:]+):([^:]+):([^:]+)")
 		local doc, _ = file:gsub("^file://", "")
 		local newBuf, _ = buffer.NewBufferFromFile(doc)
-		-- Close the references split
-		pcall(function() bp:Unsplit() end)
-		-- Record position before navigating (CurPane is now refOriginPane)
-		micro.PushJump()
-		-- Open the selected file in the origin pane
-		micro.CurPane():OpenBuffer(newBuf)
-		newBuf:GetActiveCursor():GotoLoc(buffer.Loc(character * 1, line * 1))
-		micro.CurPane():Center()
-		refOriginPane = nil
+		-- Record position in the origin pane before navigating
+		if refOriginPane ~= nil then
+			refOriginPane:PushJump()
+			refOriginPane:OpenBuffer(newBuf)
+			newBuf:GetActiveCursor():GotoLoc(buffer.Loc(character * 1, line * 1))
+			refOriginPane:Center()
+		end
 		return false
 	end
 end
