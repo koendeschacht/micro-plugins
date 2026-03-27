@@ -55,13 +55,13 @@ function jumpToEntry(bp, entry)
 end
 
 function jumpBack(bp)
+    -- Save current position first (enables jumping forward back to here)
+    if jumpIndex == #jumpHistory then
+        pushJump(bp)
+    end
     if jumpIndex <= 1 then
         micro.InfoBar():Message("No previous jump")
         return
-    end
-    -- Save current position before going back (only if at the end of history)
-    if jumpIndex == #jumpHistory then
-        pushJump(bp)
     end
     jumpIndex = jumpIndex - 1
     jumpToEntry(bp, jumpHistory[jumpIndex])
