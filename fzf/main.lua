@@ -52,5 +52,5 @@ function init()
     config.MakeCommand("fzf", fzfOpen, config.NoComplete)
     config.MakeCommand("fzfgrep", fzfGrep, config.NoComplete)
     config.TryBindKey("Ctrl-p", "command:fzf", false)
-    config.TryBindKey("Ctrl-f", "command:fzfgrep", false)
+    config.TryBindKey("Alt-g", "command:fzfgrep", false)
 end
