@@ -62,7 +62,7 @@ function shellExplore(bp)
     local f = io.open(tmprc, "w")
     f:write("[ -f ~/.bashrc ] && source ~/.bashrc\n")
     f:write("cd " .. dir .. "\n")
-    f:write("open() { echo \"$1\" > " .. tmpresult .. "; exit; }\n")
+    f:write("open() { realpath \"$1\" > " .. tmpresult .. "; exit; }\n")
     f:close()
 
     shell.RunInteractiveShell("bash --rcfile " .. tmprc, false, false)
