@@ -455,6 +455,8 @@ function definitionAction(bp)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
 
+	micro.PushJump()
+
 	local send = withSend(filetype)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
