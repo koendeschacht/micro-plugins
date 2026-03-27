@@ -23,7 +23,34 @@ function fzfOpen(bp)
     bp:OpenBuffer(buf)
 end
 
+function fzfGrep(bp)
+    local output, err = shell.RunInteractiveShell(
+        "sh -c 'rg --line-number --no-heading --color=always . | fzf --ansi'",
+        false, true)
+    if err ~= nil then
+        return
+    end
+    local trimmed = output:match("^%s*(.-)%s*$")
+    if trimmed == "" then
+        return
+    end
+    local file, line = trimmed:match("^([^:]+):(%d+):")
+    if file == nil then
+        return
+    end
+    local buf, bufErr = buffer.NewBufferFromFile(file)
+    if bufErr ~= nil then
+        micro.InfoBar():Error("fzf: could not open " .. file)
+        return
+    end
+    bp:OpenBuffer(buf)
+    bp:GotoLoc(buffer.Loc(0, line * 1 - 1))
+    bp:Center()
+end
+
 function init()
     config.MakeCommand("fzf", fzfOpen, config.NoComplete)
+    config.MakeCommand("fzfgrep", fzfGrep, config.NoComplete)
     config.TryBindKey("Ctrl-p", "command:fzf", false)
+    config.TryBindKey("Ctrl-f", "command:fzfgrep", false)
 end
