@@ -20,6 +20,7 @@ function fzfOpen(bp)
         micro.InfoBar():Error("fzf: could not open " .. file)
         return
     end
+    bp:PushJump()
     bp:OpenBuffer(buf)
 end
 
@@ -43,6 +44,7 @@ function fzfGrep(bp)
         micro.InfoBar():Error("fzf: could not open " .. file)
         return
     end
+    bp:PushJump()
     bp:OpenBuffer(buf)
     bp:GotoLoc(buffer.Loc(0, line * 1 - 1))
     bp:Center()
