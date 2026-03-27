@@ -6,7 +6,7 @@ local shell = import("micro/shell")
 local buffer = import("micro/buffer")
 
 function fzfOpen(bp)
-    local output, err = shell.RunInteractiveShell("fd --type f | fzf", false, true)
+    local output, err = shell.RunInteractiveShell("sh -c 'fd --type f | fzf'", false, true)
     if err ~= nil then
         -- user cancelled or fzf failed
         return
