@@ -94,6 +94,8 @@ end
 
 function init()
     config.MakeCommand("jgoto", jgotoAction, config.NoComplete)
+    config.MakeCommand("jumpback", jumpBack, config.NoComplete)
+    config.MakeCommand("jumpforward", jumpForward, config.NoComplete)
     config.TryBindKey("Alt-h", "command:jumpback", false)
     config.TryBindKey("Alt-l", "command:jumpforward", false)
 end
