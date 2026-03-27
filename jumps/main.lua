@@ -95,17 +95,17 @@ end
 -- Wrappers that record position before delegating to LSP plugin commands
 function jdefinitionAction(bp)
     pushJump(bp)
-    lsp.definitionAction(bp)
+    bp:HandleCommand("definition")
 end
 
 function jnextDiagnostic(bp)
     pushJump(bp)
-    lsp.nextDiagnostic(bp)
+    bp:HandleCommand("nextdiag")
 end
 
 function jprevDiagnostic(bp)
     pushJump(bp)
-    lsp.prevDiagnostic(bp)
+    bp:HandleCommand("prevdiag")
 end
 
 function init()
