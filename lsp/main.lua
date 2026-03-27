@@ -126,6 +126,8 @@ function init()
 	config.MakeCommand("format", formatAction, config.NoComplete)
 	config.MakeCommand("references", referencesAction, config.NoComplete)
 	config.MakeCommand("rename", renameAction, config.NoComplete)
+	config.MakeCommand("nextdiag", nextDiagnostic, config.NoComplete)
+	config.MakeCommand("prevdiag", prevDiagnostic, config.NoComplete)
 
 	config.TryBindKey("Alt-k", "command:hover", false)
 	config.TryBindKey("Alt-d", "command:definition", false)
@@ -133,9 +135,11 @@ function init()
 	config.TryBindKey("Alt-r", "command:references", false)
 	config.TryBindKey("CtrlSpace", "command:lspcompletion", false)
 	config.TryBindKey("F2", "command-edit:rename ", false)
+	config.TryBindKey("Alt-j", "command:nextdiag", false)
+	config.TryBindKey("Alt-J", "command:prevdiag", false)
 
 	config.AddRuntimeFile("lsp", config.RTHelp, "help/lsp.md")
-		
+
 	-- @TODO register additional actions here
 end
 
@@ -450,9 +454,11 @@ end
 
 -- the definition action request and response
 function definitionAction(bp)
-	local filetype = bp.Buf:FileType()	
+	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
-	
+
+	if pushJump then pushJump(bp) end
+
 	local send = withSend(filetype)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
@@ -932,6 +938,69 @@ function renameActionResponse(bp, data)
 	end
 
 	micro.InfoBar():Message(fmt.Sprintf("Renamed: %.0f change(s) applied", totalEdits))
+end
+
+-- diagnostic navigation
+function nextDiagnostic(bp)
+	local msgs = bp.Buf:GetMessages("lsp")
+	if msgs == nil or #msgs == 0 then
+		micro.InfoBar():Message("No diagnostics")
+		return
+	end
+	local curLine = bp.Buf:GetActiveCursor().Y
+	local target = nil
+	for _, msg in ipairs(msgs) do
+		if msg.Start.Y > curLine then
+			if target == nil or msg.Start.Y < target.Start.Y then
+				target = msg
+			end
+		end
+	end
+	-- wrap around to first diagnostic
+	if target == nil then
+		for _, msg in ipairs(msgs) do
+			if target == nil or msg.Start.Y < target.Start.Y then
+				target = msg
+			end
+		end
+	end
+	if target ~= nil then
+		if pushJump then pushJump(bp) end
+		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
+		bp:Center()
+		micro.InfoBar():Message(target.Msg)
+	end
+end
+
+function prevDiagnostic(bp)
+	local msgs = bp.Buf:GetMessages("lsp")
+	if msgs == nil or #msgs == 0 then
+		micro.InfoBar():Message("No diagnostics")
+		return
+	end
+	local curLine = bp.Buf:GetActiveCursor().Y
+	local target = nil
+	for _, msg in ipairs(msgs) do
+		if msg.Start.Y < curLine then
+			if target == nil or msg.Start.Y > target.Start.Y then
+				target = msg
+			end
+		end
+	end
+	-- wrap around to last diagnostic
+	if target == nil then
+		for _, msg in ipairs(msgs) do
+			if target == nil or msg.Start.Y > target.Start.Y then
+				target = msg
+			end
+		end
+	end
+	if target ~= nil then
+		if pushJump then pushJump(bp) end
+		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
+		bp:Center()
+		micro.InfoBar():Message(target.Msg)
+	end
 end
 
 --
