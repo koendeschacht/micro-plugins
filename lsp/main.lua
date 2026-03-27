@@ -22,6 +22,7 @@ local completionCursor = 0
 local lastCompletion = {}
 local splitBP = nil
 local tabCount = 0
+local refOriginPane = nil
 
 local json = {}
 
@@ -235,11 +236,16 @@ function preInsertNewline(bp)
 		local data = util.String(cur:GetSelection())
 		local file, line, character = data:match("(./[^:]+):([^:]+):([^:]+)")
 		local doc, _ = file:gsub("^file://", "")
-		buf, _ = buffer.NewBufferFromFile(doc)
-		bp:AddTab()
-		micro.CurPane():OpenBuffer(buf)
-		buf:GetActiveCursor():GotoLoc(buffer.Loc(character * 1, line * 1))
+		local newBuf, _ = buffer.NewBufferFromFile(doc)
+		-- Close the references split
+		pcall(function() bp:Unsplit() end)
+		-- Record position before navigating (CurPane is now refOriginPane)
+		micro.PushJump()
+		-- Open the selected file in the origin pane
+		micro.CurPane():OpenBuffer(newBuf)
+		newBuf:GetActiveCursor():GotoLoc(buffer.Loc(character * 1, line * 1))
 		micro.CurPane():Center()
+		refOriginPane = nil
 		return false
 	end
 end
@@ -852,6 +858,7 @@ function referencesActionResponse(bp, data)
 		msg = msg .. "." .. doc:sub(#rootUri + 1, #doc) .. ":" .. ref.range.start.line .. ":" .. ref.range.start.character
 	end
 
+	refOriginPane = bp
 	local logBuf = buffer.NewBuffer(msg, "References found")
 	local splitBP = bp:HSplitBuf(logBuf)
 end
