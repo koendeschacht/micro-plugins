@@ -92,12 +92,34 @@ function jgotoAction(bp, args)
     bp:Center()
 end
 
+-- Wrappers that record position before delegating to LSP plugin commands
+function jdefinitionAction(bp)
+    pushJump(bp)
+    lsp.definitionAction(bp)
+end
+
+function jnextDiagnostic(bp)
+    pushJump(bp)
+    lsp.nextDiagnostic(bp)
+end
+
+function jprevDiagnostic(bp)
+    pushJump(bp)
+    lsp.prevDiagnostic(bp)
+end
+
 function init()
     config.MakeCommand("jgoto", jgotoAction, config.NoComplete)
     config.MakeCommand("jumpback", jumpBack, config.NoComplete)
     config.MakeCommand("jumpforward", jumpForward, config.NoComplete)
+    config.MakeCommand("jdefinition", jdefinitionAction, config.NoComplete)
+    config.MakeCommand("jnextdiag", jnextDiagnostic, config.NoComplete)
+    config.MakeCommand("jprevdiag", jprevDiagnostic, config.NoComplete)
     config.TryBindKey("Alt-h", "command:jumpback", false)
     config.TryBindKey("Alt-l", "command:jumpforward", false)
+    config.TryBindKey("Alt-d", "command:jdefinition", false)
+    config.TryBindKey("Alt-j", "command:jnextdiag", false)
+    config.TryBindKey("Alt-J", "command:jprevdiag", false)
 end
 
 -- Hooks for built-in jump actions

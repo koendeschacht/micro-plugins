@@ -135,8 +135,6 @@ function init()
 	config.TryBindKey("Alt-r", "command:references", false)
 	config.TryBindKey("CtrlSpace", "command:lspcompletion", false)
 	config.TryBindKey("F2", "command-edit:rename ", false)
-	config.TryBindKey("Alt-j", "command:nextdiag", false)
-	config.TryBindKey("Alt-J", "command:prevdiag", false)
 
 	config.AddRuntimeFile("lsp", config.RTHelp, "help/lsp.md")
 
@@ -456,8 +454,6 @@ end
 function definitionAction(bp)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
-
-	if pushJump then pushJump(bp) end
 
 	local send = withSend(filetype)
 	local file = bp.Buf.AbsPath
@@ -965,7 +961,6 @@ function nextDiagnostic(bp)
 		end
 	end
 	if target ~= nil then
-		if pushJump then pushJump(bp) end
 		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
 		bp:Center()
 		micro.InfoBar():Message(target.Msg)
@@ -996,7 +991,6 @@ function prevDiagnostic(bp)
 		end
 	end
 	if target ~= nil then
-		if pushJump then pushJump(bp) end
 		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
 		bp:Center()
 		micro.InfoBar():Message(target.Msg)
