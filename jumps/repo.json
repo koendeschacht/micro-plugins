@@ -1,0 +1,14 @@
+[{
+  "Name": "jumps",
+  "Description": "Jump history navigation for Micro",
+  "Tags": ["navigation"],
+  "Versions": [
+    {
+      "Version": "0.1.0",
+      "Url": "",
+      "Require": {
+        "micro": ">=2.0.8"
+      }
+    }
+  ]
+}]
