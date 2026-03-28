@@ -21,8 +21,11 @@ local message = ''
 local completionCursor = 0
 local lastCompletion = {}
 local splitBP = nil
-local tabCount = 0
 local refOriginPane = nil
+local completionRequestToken = {}
+local diagnosticsByPath = {}
+
+local completionDebounceNs = 75 * 1000000
 
 local json = {}
 
@@ -42,6 +45,47 @@ function getUriFromBuf(buf)
 	local file = buf.AbsPath
 	local uri = fmt.Sprintf("file://%s", file)
 	return uri
+end
+
+local function decodeURIPath(pathstr)
+	if pathstr == nil then
+		return nil
+	end
+	return (pathstr:gsub("%%(%x%x)", function(hex)
+		return string.char(tonumber(hex, 16))
+	end))
+end
+
+local function diagnosticPathFromURI(uri)
+	if uri == nil then
+		return nil
+	end
+	local file = uri:gsub("^file://", "")
+	return decodeURIPath(file)
+end
+
+local function diagnosticPathFromBuf(buf)
+	if buf == nil then
+		return nil
+	end
+	return buf.AbsPath
+end
+
+local function syncBufferDiagnostics(buf)
+	if buf == nil then
+		return
+	end
+
+	buf:ClearMessages("lsp")
+
+	local msgs = diagnosticsByPath[diagnosticPathFromBuf(buf)]
+	if msgs == nil then
+		return
+	end
+
+	for _, msg in ipairs(msgs) do
+		buf:AddMessage(msg)
+	end
 end
 
 function mysplit (inputstr, sep)
@@ -105,7 +149,7 @@ function startServer(filetype, callback)
 				capabilities[filetype] = data.result and data.result.capabilities or {}
 			    callback(bp.Buf, filetype)
 			end }
-			send(currentAction[part[1]].method, fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"textDocument": {"hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}}}}', go_os.Getpid(), rootUri, rootUri, initOptions))
+			send(currentAction[part[1]].method, fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}}}}', go_os.Getpid(), rootUri, rootUri, initOptions))
 			return
 		end
 	end
@@ -127,8 +171,6 @@ function init()
 	config.MakeCommand("format", formatAction, config.NoComplete)
 	config.MakeCommand("references", referencesAction, config.NoComplete)
 	config.MakeCommand("rename", renameAction, config.NoComplete)
-	config.MakeCommand("nextdiag", nextDiagnostic, config.NoComplete)
-	config.MakeCommand("prevdiag", prevDiagnostic, config.NoComplete)
 
 	config.TryBindKey("Alt-k", "command:hover", false)
 	config.TryBindKey("Alt-d", "command:definition", false)
@@ -148,7 +190,7 @@ function withSend(filetype)
 	    	return
 	    end
 
-		micro.Log(filetype .. ">>> " .. method)
+		micro.Log(filetype .. ">>> " .. method, not isNotification and (" id=" .. id[filetype]) or "")
 		local msg = fmt.Sprintf('{"jsonrpc": "2.0", %s"method": "%s", "params": %s}', not isNotification and fmt.Sprintf('"id": %.0f, ', id[filetype]) or "", method, params)
 		id[filetype] = id[filetype] + 1
 		msg = fmt.Sprintf("Content-Length: %.0f\r\n\r\n%s", #msg, msg)
@@ -157,10 +199,16 @@ function withSend(filetype)
 	end
 end
 
-function preRune(bp, r)
+function closeSplitPane()
 	if splitBP ~= nil then
 		pcall(function () splitBP:Unsplit(); end)
 		splitBP = nil
+	end
+end
+
+function preRune(bp, r)
+	if splitBP ~= nil then
+		closeSplitPane()
 		local cur = bp.Buf:GetActiveCursor()
 		cur:Deselect(false);
 		cur:GotoLoc(buffer.Loc(cur.X + 1, cur.Y))
@@ -173,10 +221,7 @@ function onRune(bp, r)
 	if cmd[filetype] == nil then
 		return
 	end
-	if splitBP ~= nil then
-		pcall(function () splitBP:Unsplit(); end)
-		splitBP = nil
-	end
+	closeSplitPane()
 
 	local send = withSend(filetype)
 	local uri = getUriFromBuf(bp.Buf)
@@ -189,10 +234,12 @@ function onRune(bp, r)
 	version[uri] = (version[uri] or 0) + 1
 	send("textDocument/didChange", fmt.Sprintf('{"textDocument": {"version": %.0f, "uri": "%s"}, "contentChanges": [{"text": "%s"}]}', version[uri], uri, content), true)
 	local ignored = mysplit(config.GetGlobalOption("lsp.ignoreTriggerCharacters") or '', ",")
-	if r and capabilities[filetype] then
-		if not contains(ignored, "completion") and capabilities[filetype].completionProvider and capabilities[filetype].completionProvider.triggerCharacters and contains(capabilities[filetype].completionProvider.triggerCharacters, r) then
-			completionAction(bp)
-		elseif not contains(ignored, "signature") and capabilities[filetype].signatureHelpProvider and capabilities[filetype].signatureHelpProvider.triggerCharacters and contains(capabilities[filetype].signatureHelpProvider.triggerCharacters, r) then
+	if capabilities[filetype] then
+		if r and not contains(ignored, "completion") and r == '.' and capabilities[filetype].completionProvider and capabilities[filetype].completionProvider.triggerCharacters and contains(capabilities[filetype].completionProvider.triggerCharacters, r) then
+			scheduleCompletionAction(bp)
+		elseif shouldAutoTriggerCompletion(bp, r) then
+			scheduleCompletionAction(bp)
+		elseif r and not contains(ignored, "signature") and capabilities[filetype].signatureHelpProvider and capabilities[filetype].signatureHelpProvider.triggerCharacters and contains(capabilities[filetype].signatureHelpProvider.triggerCharacters, r) then
 			hoverAction(bp)
 		end
 	end
@@ -220,13 +267,10 @@ function onOutdentLine(bp) onRune(bp) end
 function onIndentLine(bp) onRune(bp) end
 function onPaste(bp) onRune(bp) end
 function onPlayMacro(bp) onRune(bp) end
-function onAutocomplete(bp) onRune(bp) end
+function onAutocomplete(bp) end
 
 function onEscape(bp) 
-	if splitBP ~= nil then
-		pcall(function () splitBP:Unsplit(); end)
-		splitBP = nil
-	end
+	closeSplitPane()
 end
 
 function preInsertNewline(bp)
@@ -285,6 +329,7 @@ function onBufferOpen(buf)
 	if cmd[filetype] then
 	    handleInitialized(buf, filetype)
 	end
+	syncBufferDiagnostics(buf)
 end
 
 function contains(list, x)
@@ -331,6 +376,7 @@ function string.parse(text)
 	if status then
 		return res
 	end
+	micro.Log("LSP parse failure", cleanedText)
 	return false
 end
 
@@ -345,6 +391,42 @@ function isIgnoredMessage(msg)
 		end
 	end
 	return false -- show this message to user
+end
+
+function configurationValue(section)
+	if section == "python.analysis" then
+		return '{"autoImportCompletions": true, "autoSearchPaths": true}'
+	elseif section == "python" then
+		return '{"analysis": {"autoImportCompletions": true, "autoSearchPaths": true}}'
+	elseif section == "pyright" then
+		return '{}'
+	end
+	return '{"enable": true}'
+end
+
+function configurationItems(params)
+	if not params or not params.items then
+		return {}
+	end
+	local items = {}
+	for key, item in pairs(params.items) do
+		if type(key) == 'number' then
+			items[key] = item
+		end
+	end
+	return items
+end
+
+function configurationResult(params)
+	local results = {}
+	local items = configurationItems(params)
+	if #items == 0 then
+		return '[{"analysis": {"autoImportCompletions": true, "autoSearchPaths": true}}]'
+	end
+	for _, item in ipairs(items) do
+		table.insert(results, configurationValue(item.section or ''))
+	end
+	return '[' .. table.join(results, ',') .. ']'
 end
 
 function onStdout(filetype)
@@ -366,34 +448,43 @@ function onStdout(filetype)
 		
 		if data.method == "workspace/configuration" then
 		    -- actually needs to respond with the same ID as the received JSON
-			local message = fmt.Sprintf('{"jsonrpc": "2.0", "id": %.0f, "result": [{"enable": true}]}', data.id)
-			shell.JobSend(cmd[filetype], fmt.Sprintf('Content-Length: %.0f\n\n%s', #message, message))
+			micro.Log(filetype .. " <<< workspace/configuration params", data.params)
+			local message = fmt.Sprintf('{"jsonrpc": "2.0", "id": %.0f, "result": %s}', data.id, configurationResult(data.params))
+			micro.Log(filetype .. " >>> workspace/configuration response", message)
+			shell.JobSend(cmd[filetype], fmt.Sprintf('Content-Length: %.0f\r\n\r\n%s', #message, message))
 		elseif data.method == "textDocument/publishDiagnostics" or data.method == "textDocument\\/publishDiagnostics" then
 			-- react to server-published event
-			local bp = micro.CurPane().Buf
-			bp:ClearMessages("lsp")
-			bp:AddMessage(buffer.NewMessage("lsp", "", buffer.Loc(0, 10000000), buffer.Loc(0, 10000000), buffer.MTInfo))
-			local uri = getUriFromBuf(bp)
-			if data.params.uri == uri then
-				for _, diagnostic in ipairs(data.params.diagnostics) do
-					local type = buffer.MTInfo
-					if diagnostic.severity == 1 then
-						type = buffer.MTError
-					elseif diagnostic.severity == 2 then
-						type = buffer.MTWarning
-					end
-					local mstart = buffer.Loc(diagnostic.range.start.character, diagnostic.range.start.line)
-		            local mend = buffer.Loc(diagnostic.range["end"].character, diagnostic.range["end"].line)
-	
-					if not isIgnoredMessage(diagnostic.message) then
-						msg = buffer.NewMessage("lsp", diagnostic.message, mstart, mend, type)
-						bp:AddMessage(msg)
-		            end
+			local uri = data.params.uri
+			local diagnosticPath = diagnosticPathFromURI(uri)
+			local uriDiagnostics = {}
+			diagnosticsByPath[diagnosticPath] = uriDiagnostics
+			for _, diagnostic in ipairs(data.params.diagnostics) do
+				local type = buffer.MTInfo
+				if diagnostic.severity == 1 then
+					type = buffer.MTError
+				elseif diagnostic.severity == 2 then
+					type = buffer.MTWarning
 				end
+				local mstart = buffer.Loc(diagnostic.range.start.character, diagnostic.range.start.line)
+		            local mend = buffer.Loc(diagnostic.range["end"].character, diagnostic.range["end"].line)
+
+				if not isIgnoredMessage(diagnostic.message) then
+					local msg = buffer.NewMessage("lsp", diagnostic.message, mstart, mend, type)
+					table.insert(uriDiagnostics, msg)
+				end
+			end
+
+			local curPane = micro.CurPane()
+			if curPane ~= nil and curPane.Buf ~= nil and diagnosticPath == diagnosticPathFromBuf(curPane.Buf) then
+				syncBufferDiagnostics(curPane.Buf)
 			end
 		elseif currentAction[filetype] and currentAction[filetype].method and not data.method and currentAction[filetype].response and data.jsonrpc then			-- react to custom action event
 			local bp = micro.CurPane()
 			micro.Log("Received message for ", filetype, data)
+			micro.Log(filetype .. " <<< response", " id=", data.id or "nil", " expected=", currentAction[filetype].method)
+			if data.error then
+				micro.Log(filetype .. " <<< error", data.error)
+			end
 			currentAction[filetype].response(bp, data)
 			currentAction[filetype] = {}
 		elseif data.method == "window/showMessage" or data.method == "window\\/showMessage" then
@@ -582,195 +673,147 @@ function findCommon(input, list)
 	return longest
 end
 
+function jsonEscape(str)
+	return (str or ''):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+end
+
+function normalizeInsertText(entry)
+	if entry.insertTextFormat == 2 then
+		return entry.label or ''
+	end
+	return entry.textEdit and entry.textEdit.newText or entry.insertText or entry.label or ''
+end
+
+function serializeAdditionalTextEdits(entry)
+	local out = {}
+	for _, edit in ipairs(entry.additionalTextEdits or {}) do
+		if edit.range and edit.range.start and edit.range['end'] then
+			table.insert(out, fmt.Sprintf('{"text":"%s","start":{"x":%.0f,"y":%.0f},"end":{"x":%.0f,"y":%.0f}}',
+				jsonEscape(edit.newText or ''),
+				edit.range.start.character,
+				edit.range.start.line,
+				edit.range['end'].character,
+				edit.range['end'].line))
+		end
+	end
+	return '[' .. table.join(out, ',') .. ']'
+end
+
+function inferCompletionRange(bp, results)
+	local xy = buffer.Loc(bp.Cursor.X, bp.Cursor.Y)
+	if results[1] and results[1].textEdit and results[1].textEdit.range then
+		local range = results[1].textEdit.range
+		return buffer.Loc(range.start.character, range.start.line), buffer.Loc(range['end'].character, range['end'].line)
+	end
+
+	local cur = bp.Buf:GetActiveCursor()
+	cur:SelectLine()
+	local lineContent = util.String(cur:GetSelection()):gsub("\r?\n$", "")
+	cur:ResetSelection()
+	cur:GotoLoc(xy)
+
+	local left = lineContent:sub(1, xy.X)
+	local right = lineContent:sub(xy.X + 1)
+	local prefix = left:match("([%w_]+)$") or ""
+	local suffix = right:match("^([%w_]+)") or ""
+	return buffer.Loc(xy.X - #prefix, xy.Y), buffer.Loc(xy.X + #suffix, xy.Y)
+end
+
+function serializeCompletionItems(results)
+	local out = {}
+	for _, entry in ipairs(results) do
+		local insert = normalizeInsertText(entry)
+		local label = entry.label or insert
+		if insert ~= '' and label ~= '' then
+			table.insert(out, fmt.Sprintf('{"insert":"%s","label":"%s","additionalTextEdits":%s,"sortText":"%s","preselect":%s,"deprecated":%s}',
+				jsonEscape(insert),
+				jsonEscape(label),
+				serializeAdditionalTextEdits(entry),
+				jsonEscape(entry.sortText or ''),
+				entry.preselect and 'true' or 'false',
+				entry.deprecated and 'true' or 'false'))
+		end
+	end
+	return '[' .. table.join(out, ',') .. ']'
+end
+
+function isAutocompleteRune(r)
+	return r == '.' or (r and r:match('[%w_]') ~= nil)
+end
+
+function isMemberAccessContext(bp)
+	if bp == nil or bp.Buf == nil then
+		return false
+	end
+	local cur = bp.Buf:GetActiveCursor()
+	cur:SelectLine()
+	local lineContent = util.String(cur:GetSelection()):gsub("\r?\n$", "")
+	cur:ResetSelection()
+	cur:GotoLoc(buffer.Loc(cur.X, cur.Y))
+	local left = lineContent:sub(1, cur.X)
+	return left:match("[%w_]+%.[%w_]*$") ~= nil
+		or left:match("[%w_]+%.[%w_]+%.[%w_]*$") ~= nil
+end
+
+function shouldAutoTriggerCompletion(bp, r)
+	if bp == nil or bp.Buf == nil then
+		return false
+	end
+	if r == '.' then
+		return true
+	end
+	if r ~= nil then
+		return isAutocompleteRune(r)
+	end
+	if not (bp.Buf.CompletionMenu or bp.Buf:HasGhostCompletion()) then
+		return false
+	end
+	if isMemberAccessContext(bp) then
+		return true
+	end
+	if bp.Buf:CurrentWordLength() > 0 then
+		return true
+	end
+	return false
+end
+
+function scheduleCompletionAction(bp)
+	if bp == nil or bp.Buf == nil then
+		return
+	end
+	local file = bp.Buf.AbsPath or ''
+	completionRequestToken[file] = (completionRequestToken[file] or 0) + 1
+	local token = completionRequestToken[file]
+	micro.After(completionDebounceNs, function()
+		if bp == nil or bp.Buf == nil then
+			return
+		end
+		local currentFile = bp.Buf.AbsPath or ''
+		if completionRequestToken[currentFile] ~= token then
+			return
+		end
+		completionAction(bp)
+	end)
+end
+
 function completionActionResponse(bp, data)
 	local results = data.result
 	if results == nil then 
+		micro.Log("completionActionResponse: nil result", data)
 		return
 	end
 	if results.items then
 		results = results.items
 	end
-	
-	local xy = buffer.Loc(bp.Cursor.X, bp.Cursor.Y)
-	local start = xy
-	if bp.Cursor:HasSelection() then
-		bp.Cursor:DeleteSelection()
-	end
-
-	local found = false
-	local prefix = ""
-	local reversed = ""
-	-- if we have no defined ranges in the result
-	-- try to find out what our prefix is we want to filter against
-	if not results[1] or not results[1].textEdit or not results[1].textEdit.range then
-		if capabilities[bp.Buf:FileType()] and capabilities[bp.Buf:FileType()].completionProvider and capabilities[bp.Buf:FileType()].completionProvider.triggerCharacters then
-			local cur = bp.Buf:GetActiveCursor()
-			cur:SelectLine()
-			local lineContent = util.String(cur:GetSelection())
-			reversed = string.reverse(lineContent:gsub("\r?\n$", ""):sub(1, xy.X))
-			local triggerChars = capabilities[bp.Buf:FileType()].completionProvider.triggerCharacters
-			for i = 1,#reversed,1 do
-				local char = reversed:sub(i,i)
-				-- try to find a trigger character or any other non-word character
-				if contains(triggerChars, char) or contains({" ", ":", "/", "-", "\t", ";"}, char) then
-					found = true
-					start = buffer.Loc(#reversed - (i - 1), bp.Cursor.Y)
-					bp.Cursor:SetSelectionStart(start)
-					bp.Cursor:SetSelectionEnd(xy)
-					prefix = util.String(cur:GetSelection())
-					bp.Cursor:DeleteSelection()
-					bp.Cursor:ResetSelection()
-					break
-				end
-			end
-			if not found then
-				prefix = lineContent:gsub("\r?\n$", '')
-			end
-		end
-		-- if we have found a prefix
-		if prefix ~= "" then
-		    -- filter it down to what is suggested by the prefix
-			results = table.filter(results, function (entry)
-				return entry.label:starts(prefix)
-			end)
-		end
-	end
-
-	table.sort(results, function (left, right)
-		return (left.sortText or left.label) < (right.sortText or right.label)
-	end)
-	
-	entry = results[(completionCursor % #results) + 1]
-	-- if no matching results are found
-	if entry == nil then 
-	    -- reposition cursor and stop
-		bp.Cursor:GotoLoc(xy)
+	micro.Log("completionActionResponse: count", #results)
+	if #results == 0 then
+		bp.Buf:DropProviderCompletions("lsp")
 		return
 	end
-	local commonStart = ''
-	local toInsert = entry.textEdit and entry.textEdit.newText or entry.label
-	local isTabCompletion = config.GetGlobalOption("lsp.tabcompletion")
-	if isTabCompletion and not entry.textEdit then
-		commonStart = findCommon(entry, results)
-		bp.Buf:Insert(start, commonStart)
-		if prefix ~= commonStart then
-			return
-		end
-		start = buffer.Loc(start.X + #prefix, start.Y)
-	else
-		prefix = ''
-	end
 
-	if entry.textEdit and entry.textEdit.range then
-		start = buffer.Loc(entry.textEdit.range.start.character, entry.textEdit.range.start.line)
-		bp.Cursor:SetSelectionStart(start)
-		bp.Cursor:SetSelectionEnd(xy)
-		bp.Cursor:DeleteSelection()
-		bp.Cursor:ResetSelection()
-	elseif capabilities[bp.Buf:FileType()] and capabilities[bp.Buf:FileType()].completionProvider and capabilities[bp.Buf:FileType()].completionProvider.triggerCharacters then
-		if not found then
-			-- we found nothing - so assume we need the beginning of the line
-			if reversed:starts(" ") or reversed:starts("\t") then
-				-- if we end with some indentation, keep it
-				start = buffer.Loc(#reversed, bp.Cursor.Y)
-			else
-				start = buffer.Loc(0, bp.Cursor.Y)
-			end
-			bp.Cursor:SetSelectionStart(start)
-			bp.Cursor:SetSelectionEnd(xy)
-			bp.Cursor:DeleteSelection()
-			bp.Cursor:ResetSelection()
-		end
-	end
-	local inserting = "" .. toInsert:gsub(prefix, "")
-	bp.Buf:Insert(start, inserting)
-	
-	if #results > 1 then
-		if entry.textEdit then
-			bp.Cursor:GotoLoc(start)
-			bp.Cursor:SetSelectionStart(start)
-		else
-			-- if we had to calculate everything outselves
-			-- go back to the original location
-			bp.Cursor:GotoLoc(xy)
-			bp.Cursor:SetSelectionStart(xy)
-		end
-		bp.Cursor:SetSelectionEnd(buffer.Loc(start.X + #toInsert, start.Y))
-	else
-		bp.Cursor:GotoLoc(buffer.Loc(start.X + #inserting, start.Y))
-	end
-	
-	local startLoc = buffer.Loc(0, 0)
-	local endLoc = buffer.Loc(0, 0)	
-	local msg = ''
-	local insertion = ''
-	if entry.detail or entry.documentation then
-		insertion = fmt.Sprintf("%s", entry.detail or entry.documentation or '')
-		for idx, result in ipairs(results) do
-			if #msg > 0 then
-				msg = msg .. "\n"
-			end
-			local insertion = fmt.Sprintf("%s %s", result.detail or '', result.documentation or '')
-			if idx == (completionCursor % #results) + 1 then
-				local msglines = mysplit(msg, "\n")
-				startLoc = buffer.Loc(0, #msglines)
-				endLoc = buffer.Loc(#insertion - 1, #msglines)
-			end
-			msg = msg .. insertion
-		end
-	else
-		insertion = entry.label
-		for idx, result in ipairs(results) do
-			if #msg > 0 then
-				local msglines = mysplit(msg, "\n")
-				local lastLine = msglines[#msglines]
-				local len = #result.label + 4
-				if #lastLine + len >= bp:GetView().Width then
-					msg = msg .. "\n  "
-				else 
-					msg = msg .. '  '
-				end
-			else
-				msg = "  "
-			end
-			if idx == (completionCursor % #results) + 1 then
-				local msglines = mysplit(msg, "\n")
-				local prefixLen = 0
-				if #msglines > 0 then
-		    		prefixLen = #msglines[#msglines]
-		    	else
-		    		prefixLen = #msg
-		    	end
-				startLoc = buffer.Loc(prefixLen or 0, #msglines - 1)
-				endLoc = buffer.Loc(prefixLen + #result.label, #msglines - 1)
-			end
-			msg = msg .. result.label
-		end
-	end
-	if config.GetGlobalOption("lsp.autocompleteDetails") then
-		if not splitBP then
-			local tmpName = ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"):random(32)
-			local logBuf = buffer.NewBuffer(msg, tmpName)
-			splitBP = bp:HSplitBuf(logBuf)
-			bp:NextSplit()
-		else
-			splitBP:SelectAll()
-			splitBP.Cursor:DeleteSelection()
-			splitBP.Cursor:ResetSelection()
-			splitBP.Buf:insert(buffer.Loc(1, 1), msg)
-		end
-		splitBP.Cursor:ResetSelection()
-		splitBP.Cursor:SetSelectionStart(startLoc)
-		splitBP.Cursor:SetSelectionEnd(endLoc)
-	else
-		if entry.detail or entry.documentation then
-			micro.InfoBar():Message(insertion)
-		else
-			local cleaned = " " .. msg:gsub("%s+", "  ")
-			local replaced, _ = cleaned:gsub(".*%s" .. insertion .. "%s?", " [" .. insertion .. "] ")
-			micro.InfoBar():Message(replaced)
-		end
-	end
+	local start, ending = inferCompletionRange(bp, results)
+	local payload = serializeCompletionItems(results)
+	bp.Buf:ShowExternalCompletionsJSON(payload, start.X, start.Y, ending.X, ending.Y)
 end
 
 function formatAction(bp, callback)
@@ -858,7 +901,7 @@ function referencesActionResponse(bp, data)
 
 	refOriginPane = bp
 	local logBuf = buffer.NewBuffer(msg, "References found")
-	local splitBP = bp:HSplitBuf(logBuf)
+	splitBP = bp:HSplitBuf(logBuf)
 end
 
 -- the rename action request and response
@@ -943,64 +986,9 @@ function renameActionResponse(bp, data)
 	micro.InfoBar():Message(fmt.Sprintf("Renamed: %.0f change(s) applied", totalEdits))
 end
 
--- diagnostic navigation
-function nextDiagnostic(bp)
-	local msgs = bp.Buf:GetMessages("lsp")
-	if msgs == nil or #msgs == 0 then
-		micro.InfoBar():Message("No diagnostics")
-		return
-	end
-	local curLine = bp.Buf:GetActiveCursor().Y
-	local target = nil
-	for _, msg in ipairs(msgs) do
-		if msg.Start.Y > curLine then
-			if target == nil or msg.Start.Y < target.Start.Y then
-				target = msg
-			end
-		end
-	end
-	-- wrap around to first diagnostic
-	if target == nil then
-		for _, msg in ipairs(msgs) do
-			if target == nil or msg.Start.Y < target.Start.Y then
-				target = msg
-			end
-		end
-	end
-	if target ~= nil then
-		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
-		bp:Center()
-		micro.InfoBar():Message(target.Msg)
-	end
-end
-
-function prevDiagnostic(bp)
-	local msgs = bp.Buf:GetMessages("lsp")
-	if msgs == nil or #msgs == 0 then
-		micro.InfoBar():Message("No diagnostics")
-		return
-	end
-	local curLine = bp.Buf:GetActiveCursor().Y
-	local target = nil
-	for _, msg in ipairs(msgs) do
-		if msg.Start.Y < curLine then
-			if target == nil or msg.Start.Y > target.Start.Y then
-				target = msg
-			end
-		end
-	end
-	-- wrap around to last diagnostic
-	if target == nil then
-		for _, msg in ipairs(msgs) do
-			if target == nil or msg.Start.Y > target.Start.Y then
-				target = msg
-			end
-		end
-	end
-	if target ~= nil then
-		bp.Buf:GetActiveCursor():GotoLoc(buffer.Loc(target.Start.X, target.Start.Y))
-		bp:Center()
-		micro.InfoBar():Message(target.Msg)
+function onSetActive(bp)
+	if bp ~= nil then
+		syncBufferDiagnostics(bp.Buf)
 	end
 end
 

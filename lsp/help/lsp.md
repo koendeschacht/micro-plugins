@@ -332,4 +332,3 @@ the useful ones.
 [lua-lsp - A Lua language server](https://github.com/Alloyed/lua-lsp)
 
 [intelephense - the PHP language server](https://github.com/bmewburn/intelephense-docs/blob/master/installation.md)
-
