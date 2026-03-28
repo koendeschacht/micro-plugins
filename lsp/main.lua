@@ -13,7 +13,7 @@ local filepath = import("path/filepath")
 local cmd = {}
 local id = {}
 local version = {}
-local currentAction = {}
+local pendingActions = {}
 local capabilities = {}
 local filetype = ''
 local rootUri = ''
@@ -142,14 +142,14 @@ function startServer(filetype, callback)
 		local send = withSend(part[1])
 		if cmd[part[1]] ~= nil then return; end
 			id[part[1]] = 0
+			pendingActions[part[1]] = {}
 			micro.Log("Starting server", part[1])
 			cmd[part[1]] = shell.JobSpawn(runCmd, args, onStdout(part[1]), onStderr, onExit(part[1]), {})
-			currentAction[part[1]] = { method = "initialize", response = function (bp, data)
+			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}}}}', go_os.Getpid(), rootUri, rootUri, initOptions), false, { method = "initialize", response = function (bp, data)
 			    send("initialized", "{}", true)
 				capabilities[filetype] = data.result and data.result.capabilities or {}
 			    callback(bp.Buf, filetype)
-			end }
-			send(currentAction[part[1]].method, fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}}}}', go_os.Getpid(), rootUri, rootUri, initOptions))
+			end })
 			return
 		end
 	end
@@ -185,17 +185,30 @@ function init()
 end
 
 function withSend(filetype)
-	return function (method, params, isNotification) 
+	return function (method, params, isNotification, action) 
 	    if cmd[filetype] == nil then
 	    	return
 	    end
 
-		micro.Log(filetype .. ">>> " .. method, not isNotification and (" id=" .. id[filetype]) or "")
-		local msg = fmt.Sprintf('{"jsonrpc": "2.0", %s"method": "%s", "params": %s}', not isNotification and fmt.Sprintf('"id": %.0f, ', id[filetype]) or "", method, params)
-		id[filetype] = id[filetype] + 1
+		local requestID = nil
+		if not isNotification then
+			requestID = id[filetype]
+			micro.Log(filetype .. ">>> " .. method, " id=" .. requestID)
+		else
+			micro.Log(filetype .. ">>> " .. method)
+		end
+		local msg = fmt.Sprintf('{"jsonrpc": "2.0", %s"method": "%s", "params": %s}', requestID ~= nil and fmt.Sprintf('"id": %.0f, ', requestID) or "", method, params)
+		if requestID ~= nil then
+			id[filetype] = id[filetype] + 1
+			if action ~= nil then
+				pendingActions[filetype] = pendingActions[filetype] or {}
+				pendingActions[filetype][tostring(requestID)] = action
+			end
+		end
 		msg = fmt.Sprintf("Content-Length: %.0f\r\n\r\n%s", #msg, msg)
 		--micro.Log("send", filetype, "sending", method or msg, msg)
 		shell.JobSend(cmd[filetype], msg)
+		return requestID
 	end
 end
 
@@ -478,15 +491,18 @@ function onStdout(filetype)
 			if curPane ~= nil and curPane.Buf ~= nil and diagnosticPath == diagnosticPathFromBuf(curPane.Buf) then
 				syncBufferDiagnostics(curPane.Buf)
 			end
-		elseif currentAction[filetype] and currentAction[filetype].method and not data.method and currentAction[filetype].response and data.jsonrpc then			-- react to custom action event
+		elseif not data.method and data.jsonrpc and data.id ~= nil then			-- react to custom action event
 			local bp = micro.CurPane()
-			micro.Log("Received message for ", filetype, data)
-			micro.Log(filetype .. " <<< response", " id=", data.id or "nil", " expected=", currentAction[filetype].method)
-			if data.error then
-				micro.Log(filetype .. " <<< error", data.error)
+			local action = pendingActions[filetype] and pendingActions[filetype][tostring(data.id)]
+			if action and action.response then
+				micro.Log("Received message for ", filetype, data)
+				micro.Log(filetype .. " <<< response", " id=", data.id or "nil", " expected=", action.method)
+				pendingActions[filetype][tostring(data.id)] = nil
+				if data.error then
+					micro.Log(filetype .. " <<< error", data.error)
+				end
+				action.response(bp, data)
 			end
-			currentAction[filetype].response(bp, data)
-			currentAction[filetype] = {}
 		elseif data.method == "window/showMessage" or data.method == "window\\/showMessage" then
 			if filetype == micro.CurPane().Buf:FileType() then
 				micro.InfoBar():Message(data.params.message)
@@ -515,7 +531,7 @@ end
 
 function onExit(filetype)
 	return function (str)
-		currentAction[filetype] = nil
+		pendingActions[filetype] = nil
 		cmd[filetype] = nil
 		micro.Log("ONEXIT", filetype, str)
 	end
@@ -530,8 +546,7 @@ function hoverAction(bp)
 		local file = bp.Buf.AbsPath
 		local line = bp.Buf:GetActiveCursor().Y
 		local char = bp.Buf:GetActiveCursor().X
-		currentAction[filetype] = { method = "textDocument/hover", response = hoverActionResponse }
-		send(currentAction[filetype].method, fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char))
+		send("textDocument/hover", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, { method = "textDocument/hover", response = hoverActionResponse })
 	end
 end
 
@@ -556,8 +571,7 @@ function definitionAction(bp)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
-	currentAction[filetype] = { method = "textDocument/definition", response = definitionActionResponse }
-	send(currentAction[filetype].method, fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char))
+	send("textDocument/definition", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, { method = "textDocument/definition", response = definitionActionResponse })
 end
 
 function definitionActionResponse(bp, data)
@@ -631,8 +645,7 @@ function completionAction(bp)
 	end
 	if cmd[filetype] == nil then return; end
 	lastCompletion = {file, line, char}
-	currentAction[filetype] = { method = "textDocument/completion", response = completionActionResponse }
-	send(currentAction[filetype].method, fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char))
+	send("textDocument/completion", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, { method = "textDocument/completion", response = completionActionResponse })
 end
 
 table.filter = function(t, filterIter)
@@ -823,8 +836,7 @@ function formatAction(bp, callback)
 	local file = bp.Buf.AbsPath
 	local cfg = bp.Buf.Settings
 
-	currentAction[filetype] = { method = "textDocument/formatting", response = formatActionResponse(callback) }
-	send(currentAction[filetype].method, fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "options": {"tabSize": %.0f, "insertSpaces": %t, "trimTrailingWhitespace": %t, "insertFinalNewline": %t}}', file, cfg["tabsize"], cfg["tabstospaces"], cfg["rmtrailingws"], cfg["eofnewline"]))
+	send("textDocument/formatting", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "options": {"tabSize": %.0f, "insertSpaces": %t, "trimTrailingWhitespace": %t, "insertFinalNewline": %t}}', file, cfg["tabsize"], cfg["tabstospaces"], cfg["rmtrailingws"], cfg["eofnewline"]), false, { method = "textDocument/formatting", response = formatActionResponse(callback) })
 end
 
 function formatActionResponse(callback)
@@ -881,8 +893,7 @@ function referencesAction(bp)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
-	currentAction[filetype] = { method = "textDocument/references", response = referencesActionResponse }
-	send(currentAction[filetype].method, fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "context": {"includeDeclaration":true}}', file, line, char))
+	send("textDocument/references", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "context": {"includeDeclaration":true}}', file, line, char), false, { method = "textDocument/references", response = referencesActionResponse })
 end
 
 function referencesActionResponse(bp, data)
@@ -918,11 +929,10 @@ function renameAction(bp, args)
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
 
-	currentAction[filetype] = { method = "textDocument/rename", response = renameActionResponse }
-	send(currentAction[filetype].method, fmt.Sprintf(
+	send("textDocument/rename", fmt.Sprintf(
 		'{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "newName": "%s"}',
 		file, line, char, args[1]
-	))
+	), false, { method = "textDocument/rename", response = renameActionResponse })
 end
 
 function applyTextEdits(bp, edits)
