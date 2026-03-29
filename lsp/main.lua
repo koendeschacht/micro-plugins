@@ -26,6 +26,7 @@ local completionRequestToken = {}
 local semanticRequestToken = {}
 local diagnosticsByPath = {}
 local semanticByPath = {}
+local tempFileCounter = 0
 
 local completionDebounceNs = 75 * 1000000
 local semanticDebounceNs = 120 * 1000000
@@ -108,6 +109,11 @@ local function supportsSemanticTokens(filetype)
 	return provider ~= nil and provider.full ~= nil and provider.legend ~= nil and provider.legend.tokenTypes ~= nil
 end
 
+local function supportsDidSave(filetype)
+	local sync = capabilities[filetype] and capabilities[filetype].textDocumentSync
+	return type(sync) == "table" and sync.save ~= nil and sync.save ~= false
+end
+
 local function syncBufferSemanticHighlights(buf)
 	if buf == nil then
 		return
@@ -126,6 +132,118 @@ local function syncBufferSemanticHighlights(buf)
 	end
 
 	buf:ClearSemanticHighlights()
+end
+
+local function fileExists(name)
+	if name == nil or name == '' then
+		return false
+	end
+	local info, err = go_os.Stat(name)
+	return err == nil and info ~= nil and not info:IsDir()
+end
+
+local function parentDir(name)
+	if name == nil or name == '' then
+		return ''
+	end
+	local dir = filepath.Dir(name)
+	if dir == "." then
+		return ''
+	end
+	return dir
+end
+
+local function findPythonFormatter(file)
+	local dir = parentDir(file)
+	while dir ~= nil and dir ~= '' do
+		local venvRuff = filepath.Join(dir, ".venv", "bin", "ruff")
+		if fileExists(venvRuff) then
+			return venvRuff
+		end
+		local parent = parentDir(dir)
+		if parent == dir then
+			break
+		end
+		dir = parent
+	end
+
+	local home, _ = go_os.Getenv("HOME")
+	local localRuff = filepath.Join(home or "", ".local", "bin", "ruff")
+	if fileExists(localRuff) then
+		return localRuff
+	end
+
+	return nil
+end
+
+local function replaceWholeBuffer(bp, text)
+	local original = buffer.Loc(bp.Cursor.X, bp.Cursor.Y)
+	local start = bp.Buf:Start()
+	local finish = bp.Buf:End()
+
+	bp.Cursor:GotoLoc(start)
+	bp.Cursor:SetSelectionStart(start)
+	bp.Cursor:SetSelectionEnd(finish)
+	bp.Cursor:DeleteSelection()
+	bp.Cursor:ResetSelection()
+
+	if text ~= nil and text ~= '' then
+		bp.Buf:insert(start, text)
+	end
+
+	bp.Cursor:GotoLoc(original)
+	onRune(bp)
+end
+
+local function externalPythonFormat(bp, callback)
+	local file = bp.Buf.AbsPath
+	if file == nil or file == '' then
+		micro.InfoBar():Message("Formatting requires a file on disk")
+		return true
+	end
+
+	local formatter = findPythonFormatter(file)
+	if formatter == nil then
+		micro.InfoBar():Message("No Python formatter found (looked for Ruff in .venv/bin/ruff)")
+		return true
+	end
+
+	local dir = parentDir(file)
+	tempFileCounter = tempFileCounter + 1
+	local tmpName = dir .. "/.micro-format-" .. tostring(go_os.Getpid()) .. "-" .. tostring(tempFileCounter) .. ".py"
+
+	local content = bp.Buf:Bytes()
+	local err = go_os.WriteFile(tmpName, content, 384)
+	if err ~= nil then
+		go_os.Remove(tmpName)
+		micro.InfoBar():Message("Could not write temporary file: " .. err:Error())
+		return true
+	end
+
+	local _, cmdErr = shell.ExecCommand(formatter, "format", tmpName)
+	if cmdErr ~= nil then
+		go_os.Remove(tmpName)
+		micro.InfoBar():Message("Ruff format failed: " .. cmdErr:Error())
+		return true
+	end
+
+	local formatted, readErr = go_os.ReadFile(tmpName)
+	go_os.Remove(tmpName)
+	if readErr ~= nil then
+		micro.InfoBar():Message("Could not read formatted output: " .. readErr:Error())
+		return true
+	end
+
+	local formattedText = util.String(formatted)
+	local currentText = util.String(content)
+	if formattedText ~= currentText then
+		replaceWholeBuffer(bp, formattedText)
+	end
+
+	if callback ~= nil then
+		callback(bp)
+	end
+	return true
 end
 
 function mysplit (inputstr, sep)
@@ -542,7 +660,9 @@ function onSave(bp)
 	local send = withSend(filetype)
 	local uri = getUriFromBuf(bp.Buf)
 
-	send("textDocument/didSave", fmt.Sprintf('{"textDocument": {"uri": "%s"}}', uri), true)
+	if supportsDidSave(filetype) then
+		send("textDocument/didSave", fmt.Sprintf('{"textDocument": {"uri": "%s"}}', uri), true)
+	end
 	if supportsSemanticTokens(filetype) then
 		requestSemanticTokensForBuf(bp.Buf)
 	end
@@ -1217,6 +1337,14 @@ end
 function formatAction(bp, callback)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
+	local caps = capabilities[filetype] or {}
+	if not caps.documentFormattingProvider then
+		if filetype == "python" and externalPythonFormat(bp, callback) then
+			return
+		end
+		micro.InfoBar():Message("LSP formatting is not supported for " .. filetype)
+		return
+	end
 	local send = withSend(filetype)
 	local file = bp.Buf.AbsPath
 	local cfg = bp.Buf.Settings
@@ -1226,6 +1354,10 @@ end
 
 function formatActionResponse(callback)
 	return function (bp, data)
+		if data.error ~= nil then
+			micro.InfoBar():Message("LSP formatting failed: " .. (data.error.message or "unknown error"))
+			return
+		end
 		if data.result == nil then return; end
 		local edits = data.result
 		-- make sure we apply the changes from back to front
