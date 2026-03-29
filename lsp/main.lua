@@ -23,9 +23,24 @@ local lastCompletion = {}
 local splitBP = nil
 local refOriginPane = nil
 local completionRequestToken = {}
+local semanticRequestToken = {}
 local diagnosticsByPath = {}
+local semanticByPath = {}
 
 local completionDebounceNs = 75 * 1000000
+local semanticDebounceNs = 120 * 1000000
+
+local semanticTokenTypes = {
+	"namespace", "type", "class", "enum", "interface", "struct", "typeParameter",
+	"parameter", "variable", "property", "enumMember", "event", "function", "method",
+	"macro", "keyword", "modifier", "comment", "string", "number", "regexp",
+	"operator", "decorator", "label", "escapeSequence",
+}
+
+local semanticTokenModifiers = {
+	"declaration", "definition", "readonly", "static", "deprecated", "abstract",
+	"async", "modification", "documentation", "defaultLibrary",
+}
 
 local json = {}
 
@@ -88,6 +103,31 @@ local function syncBufferDiagnostics(buf)
 	end
 end
 
+local function supportsSemanticTokens(filetype)
+	local provider = capabilities[filetype] and capabilities[filetype].semanticTokensProvider
+	return provider ~= nil and provider.full ~= nil and provider.legend ~= nil and provider.legend.tokenTypes ~= nil
+end
+
+local function syncBufferSemanticHighlights(buf)
+	if buf == nil then
+		return
+	end
+	if not supportsSemanticTokens(buf:FileType()) then
+		buf:ClearSemanticHighlights()
+		return
+	end
+
+	local uri = getUriFromBuf(buf)
+	local path = diagnosticPathFromBuf(buf)
+	local entry = semanticByPath[path]
+	if entry ~= nil and uri ~= nil and entry.version == version[uri] then
+		buf:SetSemanticHighlightsJSON(entry.payload, entry.version)
+		return
+	end
+
+	buf:ClearSemanticHighlights()
+end
+
 function mysplit (inputstr, sep)
         if sep == nil then
                 sep = "%s"
@@ -107,8 +147,184 @@ function table.join(tbl, sep)
 	return result
 end
 
+local function splitLines(text)
+	local lines = {}
+	text = text or ''
+	if text == '' then
+		return { '' }
+	end
+	text = text:gsub('\r\n', '\n')
+	for line in (text .. '\n'):gmatch('(.-)\n') do
+		table.insert(lines, line)
+	end
+	return lines
+end
+
+local function isIdentifierStart(ch)
+	return ch ~= nil and ch:match("[A-Za-z_]") ~= nil
+end
+
+local function isIdentifierChar(ch)
+	return ch ~= nil and ch:match("[A-Za-z0-9_]") ~= nil
+end
+
+local function extractPythonParameterInfo(lines)
+	local declarationsByLine = {}
+	local usageNamesByLine = {}
+	local functionScopes = {}
+	local inSignature = false
+	local parenDepth = 0
+	local bracketDepth = 0
+	local braceDepth = 0
+	local currentParam = nil
+	local currentFunction = nil
+
+	local function topLevel()
+		return parenDepth == 1 and bracketDepth == 0 and braceDepth == 0
+	end
+
+	local function commitCurrentParam()
+		if currentParam == nil or currentParam.name == nil or currentParam.name == "" or currentParam.name == "/" then
+			currentParam = nil
+			return
+		end
+		declarationsByLine[currentParam.line] = declarationsByLine[currentParam.line] or {}
+		declarationsByLine[currentParam.line][currentParam.col] = true
+		if currentFunction ~= nil then
+			currentFunction.params[currentParam.name] = true
+		end
+		currentParam = nil
+	end
+
+	for lineIndex = 1, #lines do
+		local line = lines[lineIndex] or ""
+		local scanStart = 1
+		if not inSignature then
+			if line:match("^%s*def%s+[A-Za-z_][A-Za-z0-9_]*%s*%(") or line:match("^%s*async%s+def%s+[A-Za-z_][A-Za-z0-9_]*%s*%(") then
+				local openPos = line:find("%(")
+				if openPos ~= nil then
+					inSignature = true
+					parenDepth = 1
+					bracketDepth = 0
+					braceDepth = 0
+					currentParam = nil
+					currentFunction = {
+						indent = #(line:match("^[ \t]*") or ""),
+						bodyStartLine = lineIndex + 1,
+						params = {},
+					}
+					scanStart = openPos + 1
+				end
+			end
+		end
+
+		if inSignature then
+			local col = scanStart
+			while col <= #line do
+				local ch = line:sub(col, col)
+				if ch == "(" then
+					parenDepth = parenDepth + 1
+				elseif ch == ")" then
+					if topLevel() then
+						commitCurrentParam()
+					end
+					parenDepth = parenDepth - 1
+					if parenDepth == 0 then
+						inSignature = false
+						currentParam = nil
+						if currentFunction ~= nil then
+							currentFunction.bodyStartLine = lineIndex + 1
+							table.insert(functionScopes, currentFunction)
+							currentFunction = nil
+						end
+						break
+					end
+				elseif ch == "[" then
+					bracketDepth = bracketDepth + 1
+				elseif ch == "]" then
+					bracketDepth = bracketDepth - 1
+				elseif ch == "{" then
+					braceDepth = braceDepth + 1
+				elseif ch == "}" then
+					braceDepth = braceDepth - 1
+				elseif ch == "," and topLevel() then
+					commitCurrentParam()
+				elseif topLevel() and currentParam == nil then
+					if ch ~= " " and ch ~= "\t" then
+						if ch == "*" then
+						elseif ch == "/" then
+							currentParam = { name = "/" }
+						else
+							local startCol = col
+							if isIdentifierStart(ch) then
+								local endCol = col
+								while endCol <= #line and isIdentifierChar(line:sub(endCol, endCol)) do
+									endCol = endCol + 1
+								end
+								currentParam = {
+									line = lineIndex - 1,
+									col = startCol - 1,
+									name = line:sub(startCol, endCol - 1),
+								}
+								col = endCol - 1
+							end
+						end
+					end
+				end
+				col = col + 1
+			end
+		end
+	end
+
+	local activeScopes = {}
+	local nextScope = 1
+	for lineIndex = 1, #lines do
+		while nextScope <= #functionScopes and functionScopes[nextScope].bodyStartLine == lineIndex do
+			table.insert(activeScopes, functionScopes[nextScope])
+			nextScope = nextScope + 1
+		end
+
+		local line = lines[lineIndex] or ""
+		local trimmed = line:match("^%s*(.-)%s*$") or ""
+		local isCodeLine = trimmed ~= "" and trimmed:sub(1, 1) ~= "#"
+		if isCodeLine then
+			local indent = #(line:match("^[ \t]*") or "")
+			while #activeScopes > 0 and indent <= activeScopes[#activeScopes].indent do
+				table.remove(activeScopes)
+			end
+		end
+
+		if #activeScopes > 0 then
+			local activeNames = {}
+			for _, scope in ipairs(activeScopes) do
+				for name in pairs(scope.params) do
+					activeNames[name] = true
+				end
+			end
+			usageNamesByLine[lineIndex - 1] = activeNames
+		end
+	end
+
+	return {
+		declarations = declarationsByLine,
+		usageNames = usageNamesByLine,
+	}
+end
+
 function parseOptions(inputstr)
 	return mysplit(inputstr, ',')
+end
+
+function jsonStringArray(entries)
+	local out = {}
+	for _, entry in ipairs(entries) do
+		table.insert(out, fmt.Sprintf('"%s"', entry))
+	end
+	return '[' .. table.join(out, ',') .. ']'
+end
+
+function semanticTokensClientCapabilities()
+	return fmt.Sprintf('{"requests":{"full":true},"tokenTypes":%s,"tokenModifiers":%s,"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":false}', jsonStringArray(semanticTokenTypes), jsonStringArray(semanticTokenModifiers))
 end
 
 function startServer(filetype, callback)
@@ -145,7 +361,7 @@ function startServer(filetype, callback)
 			pendingActions[part[1]] = {}
 			micro.Log("Starting server", part[1])
 			cmd[part[1]] = shell.JobSpawn(runCmd, args, onStdout(part[1]), onStderr, onExit(part[1]), {})
-			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}}}}', go_os.Getpid(), rootUri, rootUri, initOptions), false, { method = "initialize", response = function (bp, data)
+			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}, "semanticTokens": %s}}}', go_os.Getpid(), rootUri, rootUri, initOptions, semanticTokensClientCapabilities()), false, { method = "initialize", response = function (bp, data)
 			    send("initialized", "{}", true)
 				capabilities[filetype] = data.result and data.result.capabilities or {}
 			    callback(bp.Buf, filetype)
@@ -246,6 +462,9 @@ function onRune(bp, r)
 	-- increase change version
 	version[uri] = (version[uri] or 0) + 1
 	send("textDocument/didChange", fmt.Sprintf('{"textDocument": {"version": %.0f, "uri": "%s"}, "contentChanges": [{"text": "%s"}]}', version[uri], uri, content), true)
+	if supportsSemanticTokens(filetype) then
+		scheduleSemanticTokens(bp)
+	end
 	local ignored = mysplit(config.GetGlobalOption("lsp.ignoreTriggerCharacters") or '', ",")
 	if capabilities[filetype] then
 		if r and not contains(ignored, "completion") and r == '.' and capabilities[filetype].completionProvider and capabilities[filetype].completionProvider.triggerCharacters and contains(capabilities[filetype].completionProvider.triggerCharacters, r) then
@@ -324,6 +543,9 @@ function onSave(bp)
 	local uri = getUriFromBuf(bp.Buf)
 
 	send("textDocument/didSave", fmt.Sprintf('{"textDocument": {"uri": "%s"}}', uri), true)
+	if supportsSemanticTokens(filetype) then
+		requestSemanticTokensForBuf(bp.Buf)
+	end
 end
 
 function handleInitialized(buf, filetype)
@@ -331,8 +553,13 @@ function handleInitialized(buf, filetype)
 	micro.Log("Found running lsp server for ", filetype, "firing textDocument/didOpen...")
 	local send = withSend(filetype)
 	local uri = getUriFromBuf(buf)
+	version[uri] = version[uri] or 1
 	local content = util.String(buf:Bytes()):gsub("\\", "\\\\"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub('"', '\\"'):gsub("\t", "\\t")
-	send("textDocument/didOpen", fmt.Sprintf('{"textDocument": {"uri": "%s", "languageId": "%s", "version": 1, "text": "%s"}}', uri, filetype, content), true)
+	send("textDocument/didOpen", fmt.Sprintf('{"textDocument": {"uri": "%s", "languageId": "%s", "version": %.0f, "text": "%s"}}', uri, filetype, version[uri], content), true)
+	syncBufferSemanticHighlights(buf)
+	if supportsSemanticTokens(filetype) then
+		requestSemanticTokensForBuf(buf)
+	end
 end
 
 function onBufferOpen(buf)
@@ -343,6 +570,7 @@ function onBufferOpen(buf)
 	    handleInitialized(buf, filetype)
 	end
 	syncBufferDiagnostics(buf)
+	syncBufferSemanticHighlights(buf)
 end
 
 function contains(list, x)
@@ -412,6 +640,8 @@ function configurationValue(section)
 	elseif section == "python" then
 		return '{"analysis": {"autoImportCompletions": true, "autoSearchPaths": true}}'
 	elseif section == "pyright" then
+		return '{}'
+	elseif section == "zuban" or section == "zubanls" then
 		return '{}'
 	end
 	return '{"enable": true}'
@@ -690,6 +920,142 @@ function jsonEscape(str)
 	return (str or ''):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
 end
 
+function jsonQuote(str)
+	return '"' .. jsonEscape(str) .. '"'
+end
+
+function semanticTokenGroup(tokenTypeIndex, modifierMask, legend)
+	local tokenType = legend.tokenTypes[tokenTypeIndex + 1] or "variable"
+	local parts = { tokenType }
+	for i, modifier in ipairs(legend.tokenModifiers or {}) do
+		local bit = 2 ^ (i - 1)
+		if math.floor(modifierMask / bit) % 2 == 1 then
+			table.insert(parts, modifier)
+		end
+	end
+	return table.join(parts, '.')
+end
+
+local function semanticTokenText(lines, line, start, length)
+	local content = lines[line + 1]
+	if content == nil then
+		return ""
+	end
+	return content:sub(start + 1, start + length)
+end
+
+local function isPythonParameterPosition(parameterInfo, line, start)
+	return parameterInfo ~= nil and parameterInfo.declarations ~= nil and parameterInfo.declarations[line] ~= nil and parameterInfo.declarations[line][start] == true
+end
+
+local function isPythonParameterUsage(parameterInfo, line, tokenText)
+	return parameterInfo ~= nil and parameterInfo.usageNames ~= nil and parameterInfo.usageNames[line] ~= nil and parameterInfo.usageNames[line][tokenText] == true
+end
+
+local function normalizeSemanticTokenGroup(group, tokenText, filetype, line, start, parameterInfo)
+	if filetype == "python" and isPythonParameterPosition(parameterInfo, line, start) then
+		return "parameter"
+	end
+	if filetype == "python" and group == "variable" and isPythonParameterUsage(parameterInfo, line, tokenText) then
+		return "parameter"
+	end
+	if tokenText:match("^[A-Z][A-Z0-9_]*$") then
+		return "constant"
+	end
+	return group
+end
+
+function decodeSemanticTokens(data, legend, lines, filetype)
+	local spans = {}
+	local parameterInfo = nil
+	if filetype == "python" then
+		parameterInfo = extractPythonParameterInfo(lines or {})
+	end
+	local line = 0
+	local start = 0
+	for i = 1, #data, 5 do
+		local deltaLine = data[i] or 0
+		local deltaStart = data[i + 1] or 0
+		local length = data[i + 2] or 0
+		local tokenType = data[i + 3] or 0
+		local tokenModifiers = data[i + 4] or 0
+
+		line = line + deltaLine
+		if deltaLine == 0 then
+			start = start + deltaStart
+		else
+			start = deltaStart
+		end
+
+		if length > 0 then
+			local group = semanticTokenGroup(tokenType, tokenModifiers, legend)
+			local tokenText = semanticTokenText(lines or {}, line, start, length)
+			table.insert(spans, {
+				line = line,
+				start = start,
+				length = length,
+				group = normalizeSemanticTokenGroup(group, tokenText, filetype, line, start, parameterInfo),
+			})
+		end
+	end
+	return spans
+end
+
+function serializeSemanticSpans(spans)
+	local out = {}
+	for _, span in ipairs(spans) do
+		local line = tonumber(span.line)
+		local start = tonumber(span.start)
+		local length = tonumber(span.length)
+		local group = span.group and tostring(span.group) or ''
+		if line ~= nil and start ~= nil and length ~= nil and length > 0 and group ~= '' then
+			table.insert(out, string.format('{"line":%d,"start":%d,"length":%d,"group":%s}', math.floor(line), math.floor(start), math.floor(length), jsonQuote(group)))
+		end
+	end
+	return '[' .. table.join(out, ',') .. ']'
+end
+
+function requestSemanticTokensForBuf(buf)
+	if buf == nil then
+		return
+	end
+	local filetype = buf:FileType()
+	if cmd[filetype] == nil or not supportsSemanticTokens(filetype) then
+		return
+	end
+
+	local send = withSend(filetype)
+	local uri = getUriFromBuf(buf)
+	local path = diagnosticPathFromBuf(buf)
+	local requestedVersion = version[uri] or 1
+
+	send("textDocument/semanticTokens/full", fmt.Sprintf('{"textDocument": {"uri": "%s"}}', uri), false, {
+		method = "textDocument/semanticTokens/full",
+		response = function (_, data)
+			if version[uri] ~= requestedVersion then
+				return
+			end
+
+			local payload = '[]'
+			local result = data.result
+			local provider = capabilities[filetype] and capabilities[filetype].semanticTokensProvider
+			if result ~= nil and result.data ~= nil and provider ~= nil and provider.legend ~= nil then
+				payload = serializeSemanticSpans(decodeSemanticTokens(result.data, provider.legend, splitLines(util.String(buf:Bytes())), filetype))
+			end
+
+			semanticByPath[path] = {
+				version = requestedVersion,
+				payload = payload,
+			}
+
+			local curPane = micro.CurPane()
+			if curPane ~= nil and curPane.Buf ~= nil and diagnosticPathFromBuf(curPane.Buf) == path then
+				curPane.Buf:SetSemanticHighlightsJSON(payload, requestedVersion)
+			end
+		end,
+	})
+end
+
 function normalizeInsertText(entry)
 	if entry.insertTextFormat == 2 then
 		return entry.label or ''
@@ -806,6 +1172,25 @@ function scheduleCompletionAction(bp)
 			return
 		end
 		completionAction(bp)
+	end)
+end
+
+function scheduleSemanticTokens(bp)
+	if bp == nil or bp.Buf == nil then
+		return
+	end
+	local file = bp.Buf.AbsPath or ''
+	semanticRequestToken[file] = (semanticRequestToken[file] or 0) + 1
+	local token = semanticRequestToken[file]
+	micro.After(semanticDebounceNs, function()
+		if bp == nil or bp.Buf == nil then
+			return
+		end
+		local currentFile = bp.Buf.AbsPath or ''
+		if semanticRequestToken[currentFile] ~= token then
+			return
+		end
+		requestSemanticTokensForBuf(bp.Buf)
 	end)
 end
 
@@ -999,6 +1384,15 @@ end
 function onSetActive(bp)
 	if bp ~= nil then
 		syncBufferDiagnostics(bp.Buf)
+		syncBufferSemanticHighlights(bp.Buf)
+		if supportsSemanticTokens(bp.Buf:FileType()) then
+			local uri = getUriFromBuf(bp.Buf)
+			local path = diagnosticPathFromBuf(bp.Buf)
+			local entry = semanticByPath[path]
+			if entry == nil or entry.version ~= version[uri] then
+				requestSemanticTokensForBuf(bp.Buf)
+			end
+		end
 	end
 end
 
