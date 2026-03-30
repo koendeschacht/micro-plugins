@@ -17,6 +17,8 @@ function shellExplore(bp)
     local f = io.open(tmprc, "w")
     f:write("[ -f ~/.bashrc ] && source ~/.bashrc\n")
     f:write("cd " .. dir .. "\n")
+    f:write("clear\n")
+    f:write("l\n")
     f:write("open() { realpath \"$1\" > " .. tmpresult .. "; exit; }\n")
     f:close()
 
@@ -40,5 +42,5 @@ end
 
 function init()
     config.MakeCommand("explore", shellExplore, config.NoComplete)
-    config.TryBindKey("Ctrl-b", "command:explore", false)
+    config.TryBindKey("Ctrl-o", "command:explore", false)
 end

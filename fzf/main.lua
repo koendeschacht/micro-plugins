@@ -31,6 +31,15 @@ local function shellQuote(text)
     return "'" .. string.gsub(text, "'", "'\\''") .. "'"
 end
 
+local function rankCommand(fileSearch)
+    local ranker = "awk '{ path = tolower($0); score = 10; " ..
+        "if (path ~ /(^|\\/)(src|app|lib)\\//) score = 0; " ..
+        "else if (path ~ /(^|\\/)(pkg|python)\\//) score = 1; " ..
+        "if (path ~ /(^|\\/)(tests?|__tests__|spec)\\// || path ~ /(_test\\.|_spec\\.|\\.test\\.|\\.spec\\.)/) score = score + 20; " ..
+        "printf \"%03d %s\\n\", score, $0; }'"
+    return fileSearch .. " | " .. ranker .. " | sort -k1,1n -k2,2 | cut -c5-"
+end
+
 function fzfOpen(bp)
     local fileSearch = fileSearchCommand()
     if fileSearch == nil then
@@ -46,7 +55,7 @@ function fzfOpen(bp)
 
     local resultPath = os.tmpname()
     local fzfCmd = '"' .. fzfBin .. '" --layout=reverse ' .. fzfColors
-    local shellCmd = "script -q -c " .. shellQuote(fileSearch .. " | " .. fzfCmd .. " > " .. shellQuote(resultPath)) .. " /dev/null"
+    local shellCmd = "script -q -c " .. shellQuote(rankCommand(fileSearch) .. " | " .. fzfCmd .. " > " .. shellQuote(resultPath)) .. " /dev/null"
     local _, err = shell.RunInteractiveShell(shellCmd, false, false)
     local output = ""
     local resultFile = io.open(resultPath, "r")
