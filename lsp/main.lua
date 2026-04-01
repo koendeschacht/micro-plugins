@@ -16,8 +16,8 @@ local version = {}
 local pendingActions = {}
 local capabilities = {}
 local filetype = ''
+local startupRoot, _ = go_os.Getwd()
 local rootUri = ''
-local message = ''
 local completionCursor = 0
 local lastCompletion = {}
 local splitBP = nil
@@ -28,7 +28,9 @@ local changeRequestToken = {}
 local pendingDidChange = {}
 local diagnosticsByPath = {}
 local semanticByPath = {}
+local stdoutBuffer = {}
 local tempFileCounter = 0
+local startErrorByFiletype = {}
 
 local documentChangeDebounceNs = 60 * 1000000
 local completionDebounceNs = 75 * 1000000
@@ -39,6 +41,60 @@ local function lspLog(...)
 	if ok and enabled then
 		micro.Log(...)
 	end
+end
+
+local function traceEnabled()
+	local ok, enabled = pcall(config.GetGlobalOption, "lsp.trace")
+	return ok and enabled
+end
+
+local function tracePath()
+	local ok, value = pcall(config.GetGlobalOption, "lsp.traceFile")
+	if ok and value ~= nil and value ~= '' then
+		return value
+	end
+	return "/tmp/micro-lsp.log"
+end
+
+local function resetTraceLog()
+	local file = io.open(tracePath(), "w")
+	if file ~= nil then
+		file:close()
+	end
+end
+
+local function traceLog(...)
+	if not traceEnabled() then
+		return
+	end
+
+	local parts = {}
+	for i = 1, select('#', ...) do
+		local text = tostring(select(i, ...))
+		text = text:gsub("\r", "\\r"):gsub("\n", "\\n")
+		if #text > 400 then
+			text = text:sub(1, 400) .. "..."
+		end
+		parts[i] = text
+	end
+
+	local line = table.join(parts, " ")
+	local file = io.open(tracePath(), "a")
+	if file == nil then
+		return
+	end
+	file:write(os.date("!%Y-%m-%dT%H:%M:%SZ"), " ", line, "\n")
+	file:close()
+end
+
+local function infoMessage(source, text)
+	traceLog("INFOBAR", source, text or "")
+	micro.InfoBar():Message(text)
+end
+
+local function errorMessage(source, text)
+	traceLog("INFOBAR_ERROR", source, text or "")
+	micro.InfoBar():Error(text)
 end
 
 local semanticTokenTypes = {
@@ -124,11 +180,34 @@ local function supportsDidSave(filetype)
 	return type(sync) == "table" and sync.save ~= nil and sync.save ~= false
 end
 
+local function bufferFromTarget(target)
+	if target == nil then
+		return nil
+	end
+	if target.Buf ~= nil then
+		return target.Buf
+	end
+	return target
+end
+
+local function fileTypeFromBuf(buf)
+	if buf == nil then
+		return nil
+	end
+	if buf.FileType ~= nil then
+		return buf:FileType()
+	end
+	if buf.Settings ~= nil then
+		return buf.Settings["filetype"]
+	end
+	return nil
+end
+
 local function syncBufferSemanticHighlights(buf)
 	if buf == nil then
 		return
 	end
-	if not supportsSemanticTokens(buf:FileType()) then
+	if not supportsSemanticTokens(fileTypeFromBuf(buf)) then
 		buf:ClearSemanticHighlights()
 		return
 	end
@@ -152,6 +231,29 @@ local function fileExists(name)
 	return err == nil and info ~= nil and not info:IsDir()
 end
 
+local function shellQuote(text)
+	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
+end
+
+local function commandExists(name, cwd)
+	if name == nil or name == '' then
+		return false
+	end
+
+	if name:find("/", 1, true) ~= nil then
+		if filepath.IsAbs(name) then
+			return fileExists(name)
+		end
+		if cwd ~= nil and cwd ~= '' then
+			return fileExists(filepath.Join(cwd, name))
+		end
+		return fileExists(name)
+	end
+
+	local _, err = shell.RunCommand("sh -c " .. shellQuote("command -v " .. shellQuote(name) .. " >/dev/null 2>&1"))
+	return err == nil
+end
+
 local function parentDir(name)
 	if name == nil or name == '' then
 		return ''
@@ -161,6 +263,22 @@ local function parentDir(name)
 		return ''
 	end
 	return dir
+end
+
+local function workspaceRoot()
+	if startupRoot ~= nil and startupRoot ~= '' then
+		return startupRoot
+	end
+	local wd, _ = go_os.Getwd()
+	return wd
+end
+
+local function shellCommand(runCmd, args)
+	local parts = { shellQuote(runCmd) }
+	for _, arg in ipairs(args) do
+		table.insert(parts, shellQuote(arg))
+	end
+	return table.join(parts, " ")
 end
 
 local function findPythonFormatter(file)
@@ -455,9 +573,9 @@ function semanticTokensClientCapabilities()
 	return fmt.Sprintf('{"requests":{"full":true},"tokenTypes":%s,"tokenModifiers":%s,"formats":["relative"],"overlappingTokenSupport":false,"multilineTokenSupport":false}', jsonStringArray(semanticTokenTypes), jsonStringArray(semanticTokenModifiers))
 end
 
-function startServer(filetype, callback)
-	local wd, _ = go_os.Getwd()
-	rootUri = fmt.Sprintf("file://%s", wd)
+function startServer(buf, filetype, callback)
+	local projectRoot = workspaceRoot()
+	rootUri = fmt.Sprintf("file://%s", projectRoot)
 	local envSettings, _ = go_os.Getenv("MICRO_LSP")
 	local settings = config.GetGlobalOption("lsp.server")
 	local fallback = "python=pylsp,go=gopls,typescript=deno lsp,javascript=deno lsp,markdown=deno lsp,json=deno lsp,jsonc=deno lsp,rust=rust-analyzer,lua=lua-language-server,c++=clangd,dart=dart language-server"
@@ -483,16 +601,38 @@ function startServer(filetype, callback)
 			end)
 		end
 		if filetype == part[1] then
-		local send = withSend(part[1])
-		if cmd[part[1]] ~= nil then return; end
+			local send = withSend(part[1])
+			if cmd[part[1]] ~= nil then return; end
+			if not commandExists(runCmd, projectRoot) then
+				local msg = "LSP: server not found for " .. part[1] .. ": " .. (runCmd or "")
+				traceLog("START_FAILED", part[1], msg)
+				if startErrorByFiletype[part[1]] ~= msg then
+					startErrorByFiletype[part[1]] = msg
+					errorMessage("start", msg)
+				end
+				return
+			end
+			startErrorByFiletype[part[1]] = nil
 			id[part[1]] = 0
 			pendingActions[part[1]] = {}
 			lspLog("Starting server", part[1])
-			cmd[part[1]] = shell.JobSpawn(runCmd, args, onStdout(part[1]), onStderr, onExit(part[1]), {})
-			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}, "semanticTokens": %s}}}', go_os.Getpid(), rootUri, rootUri, initOptions, semanticTokensClientCapabilities()), false, { method = "initialize", response = function (bp, data)
+			traceLog("START", part[1], "cmd", runCmd or "", "args", table.join(args, " "), "root", projectRoot or "", "rootUri", rootUri)
+			local job = shell.JobStart("cd " .. shellQuote(projectRoot) .. " && exec " .. shellCommand(runCmd, args), onStdout(part[1]), onStderr, onExit(part[1]), {})
+			if job == nil then
+				local msg = "LSP: failed to start server for " .. part[1] .. ": " .. (runCmd or "")
+				traceLog("START_SPAWN_FAILED", part[1], msg)
+				if startErrorByFiletype[part[1]] ~= msg then
+					startErrorByFiletype[part[1]] = msg
+					errorMessage("start", msg)
+				end
+				return
+			end
+			cmd[part[1]] = job
+			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}, "semanticTokens": {"augmentsSyntaxTokens": true, "requests": {"full": true}, "tokenTypes": %s, "tokenModifiers": %s, "formats": ["relative"], "overlappingTokenSupport": false, "multilineTokenSupport": false}}}}', go_os.Getpid(), rootUri, rootUri, initOptions, jsonStringArray(semanticTokenTypes), jsonStringArray(semanticTokenModifiers)), false, { method = "initialize", response = function (_, data)
 			    send("initialized", "{}", true)
 				capabilities[filetype] = data.result and data.result.capabilities or {}
-			    callback(bp.Buf, filetype)
+				traceLog("INITIALIZED", filetype, "semanticTokensProvider", capabilities[filetype].semanticTokensProvider ~= nil)
+			    callback(buf, filetype)
 			end })
 			return
 		end
@@ -504,6 +644,9 @@ function init()
 	config.RegisterCommonOption("lsp", "formatOnSave", false)
 	config.RegisterCommonOption("lsp", "autocompleteDetails", false)
 	config.RegisterCommonOption("lsp", "debug", false)
+	config.RegisterCommonOption("lsp", "trace", false)
+	config.RegisterCommonOption("lsp", "traceFile", "/tmp/micro-lsp.log")
+	resetTraceLog()
 	config.RegisterCommonOption("lsp", "ignoreMessages", "")
 	config.RegisterCommonOption("lsp", "tabcompletion", true)
 	config.RegisterCommonOption("lsp", "ignoreTriggerCharacters", "completion")
@@ -521,7 +664,7 @@ function init()
 	config.TryBindKey("Alt-d", "command:definition", false)
 	config.TryBindKey("Alt-f", "command:format", false)
 	config.TryBindKey("Alt-r", "command:references", false)
-	config.TryBindKey("CtrlSpace", "command:lspcompletion", false)
+	config.TryBindKey("Ctrl-Space", "command:lspcompletion", false)
 	config.TryBindKey("F2", "command-edit:rename ", false)
 
 	config.AddRuntimeFile("lsp", config.RTHelp, "help/lsp.md")
@@ -558,7 +701,7 @@ function withSend(filetype)
 end
 
 local function serializedBufferText(buf)
-	return util.String(buf:Bytes()):gsub("\\", "\\\\"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub('"', '\\"'):gsub("\t", "\\t")
+	return (util.String(buf:Bytes()):gsub("\\", "\\\\"):gsub("\n", "\\n"):gsub("\r", "\\r"):gsub('"', '\\"'):gsub("\t", "\\t"))
 end
 
 local function sendDidChangeForBuf(buf)
@@ -566,13 +709,14 @@ local function sendDidChangeForBuf(buf)
 		return
 	end
 
-	local filetype = buf:FileType()
+	local filetype = fileTypeFromBuf(buf)
 	if cmd[filetype] == nil then
 		return
 	end
 
 	local uri = getUriFromBuf(buf)
 	pendingDidChange[uri] = nil
+	traceLog("DID_CHANGE", filetype, diagnosticPathFromBuf(buf) or "nil", version[uri] or -1)
 	withSend(filetype)("textDocument/didChange", fmt.Sprintf(
 		'{"textDocument": {"version": %.0f, "uri": "%s"}, "contentChanges": [{"text": "%s"}]}',
 		version[uri] or 1,
@@ -595,26 +739,31 @@ local function flushPendingDidChangeForBuf(buf)
 	sendDidChangeForBuf(buf)
 end
 
-local function scheduleDidChange(bp)
-	if bp == nil or bp.Buf == nil then
+local function scheduleDidChange(target)
+	local buf = bufferFromTarget(target)
+	if buf == nil then
 		return
 	end
 
-	local uri = getUriFromBuf(bp.Buf)
+	local uri = getUriFromBuf(buf)
+	if uri == nil then
+		return
+	end
 	pendingDidChange[uri] = true
+	traceLog("SCHEDULE_DID_CHANGE", fileTypeFromBuf(buf) or "nil", diagnosticPathFromBuf(buf) or "nil", changeRequestToken[uri] or 0, version[uri] or -1)
 	changeRequestToken[uri] = (changeRequestToken[uri] or 0) + 1
 	local token = changeRequestToken[uri]
 	micro.After(documentChangeDebounceNs, function()
-		if bp == nil or bp.Buf == nil then
+		if buf == nil then
 			return
 		end
 
-		local currentURI = getUriFromBuf(bp.Buf)
+		local currentURI = getUriFromBuf(buf)
 		if currentURI ~= uri or changeRequestToken[uri] ~= token or not pendingDidChange[uri] then
 			return
 		end
 
-		sendDidChangeForBuf(bp.Buf)
+		sendDidChangeForBuf(buf)
 	end)
 end
 
@@ -634,7 +783,6 @@ function preRune(bp, r)
 	end
 end
 
--- when a new character is types, the document changes
 function onRune(bp, r)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then
@@ -642,26 +790,24 @@ function onRune(bp, r)
 	end
 	closeSplitPane()
 
-	local uri = getUriFromBuf(bp.Buf)
 	if r ~= nil then
 		lastCompletion = {}
 	end
-	-- increase change version
-	version[uri] = (version[uri] or 0) + 1
-	scheduleDidChange(bp)
-	if supportsSemanticTokens(filetype) then
-		scheduleSemanticTokens(bp)
+
+	local caps = capabilities[filetype]
+	if caps == nil then
+		return
 	end
+
 	local ignored = mysplit(config.GetGlobalOption("lsp.ignoreTriggerCharacters") or '', ",")
-	if capabilities[filetype] then
-		if r and not contains(ignored, "completion") and r == '.' and capabilities[filetype].completionProvider and capabilities[filetype].completionProvider.triggerCharacters and contains(capabilities[filetype].completionProvider.triggerCharacters, r) then
-			scheduleCompletionAction(bp)
-		elseif shouldAutoTriggerCompletion(bp, r) then
-			scheduleCompletionAction(bp)
-		elseif r and not contains(ignored, "signature") and capabilities[filetype].signatureHelpProvider and capabilities[filetype].signatureHelpProvider.triggerCharacters and contains(capabilities[filetype].signatureHelpProvider.triggerCharacters, r) then
-			flushPendingDidChangeForBuf(bp.Buf)
-			hoverAction(bp)
-		end
+
+	if r and not contains(ignored, "signature")
+			and caps.signatureHelpProvider and caps.signatureHelpProvider.triggerCharacters
+			and contains(caps.signatureHelpProvider.triggerCharacters, r) then
+		flushPendingDidChangeForBuf(bp.Buf)
+		hoverAction(bp)
+	elseif not contains(ignored, "completion") and shouldAutoTriggerCompletion(bp, r) then
+		scheduleCompletionAction(bp)
 	end
 end
 
@@ -688,6 +834,38 @@ function onIndentLine(bp) onRune(bp) end
 function onPaste(bp) onRune(bp) end
 function onPlayMacro(bp) onRune(bp) end
 function onAutocomplete(bp) end
+
+function onBeforeTextEvent(buf, t)
+	if buf == nil then
+		return true
+	end
+
+	local filetype = fileTypeFromBuf(buf)
+	if cmd[filetype] == nil then
+		return true
+	end
+
+	closeSplitPane()
+	lastCompletion = {}
+
+	local uri = getUriFromBuf(buf)
+	if uri == nil then
+		return true
+	end
+
+	version[uri] = (version[uri] or 0) + 1
+	traceLog("TEXT_EVENT", filetype, diagnosticPathFromBuf(buf) or "nil", t and t.EventType or "nil", t and t.Deltas and #t.Deltas or 0, version[uri])
+	local path = diagnosticPathFromBuf(buf)
+	if path ~= nil then
+		semanticByPath[path] = nil
+	end
+	scheduleDidChange(buf)
+	if supportsSemanticTokens(filetype) then
+		scheduleSemanticTokens(buf)
+	end
+
+	return true
+end
 
 function onEscape(bp) 
 	closeSplitPane()
@@ -742,26 +920,32 @@ end
 function handleInitialized(buf, filetype)
 	if cmd[filetype] == nil then return; end
 	lspLog("Found running lsp server for ", filetype, "firing textDocument/didOpen...")
+	traceLog("HANDLE_INITIALIZED", filetype, buf and buf.AbsPath or "nil", supportsSemanticTokens(filetype))
 	local send = withSend(filetype)
 	local uri = getUriFromBuf(buf)
 	version[uri] = version[uri] or 1
 	local content = serializedBufferText(buf)
 	send("textDocument/didOpen", fmt.Sprintf('{"textDocument": {"uri": "%s", "languageId": "%s", "version": %.0f, "text": "%s"}}', uri, filetype, version[uri], content), true)
 	syncBufferSemanticHighlights(buf)
-	if supportsSemanticTokens(filetype) then
-		requestSemanticTokensForBuf(buf)
-	end
 end
 
 function onBufferOpen(buf)
 	local filetype = buf:FileType()
 	lspLog("ONBUFFEROPEN", filetype)
-	if filetype ~= "unknown" and not cmd[filetype] then return startServer(filetype, handleInitialized); end
+	traceLog("BUFFER_OPEN", filetype, buf.AbsPath or "nil")
+	if filetype ~= "unknown" and not cmd[filetype] then return startServer(buf, filetype, handleInitialized); end
 	if cmd[filetype] then
 	    handleInitialized(buf, filetype)
 	end
 	syncBufferDiagnostics(buf)
 	syncBufferSemanticHighlights(buf)
+end
+
+function postinit()
+	local bp = micro.CurPane()
+	if bp ~= nil then
+		onSetActive(bp)
+	end
 end
 
 function contains(list, x)
@@ -863,90 +1047,154 @@ function configurationResult(params)
 	return '[' .. table.join(results, ',') .. ']'
 end
 
+local function nextLSPPayload(text)
+	if text == nil or text == '' then
+		return nil, text or ''
+	end
+
+	local headerStart, headerEnd = text:find("\r\n\r\n", 1, true)
+	if headerStart == nil then
+		headerStart, headerEnd = text:find("\n\n", 1, true)
+	end
+	if headerStart == nil then
+		return nil, text
+	end
+
+	local header = text:sub(1, headerStart - 1)
+	local length = tonumber(header:match("[Cc]ontent%-[Ll]ength:%s*(%d+)"))
+	if length == nil then
+		traceLog("STDOUT_BAD_HEADER", header)
+		return nil, ''
+	end
+
+	local bodyStart = headerEnd + 1
+	local bodyEnd = bodyStart + length - 1
+	if #text < bodyEnd then
+		return nil, text
+	end
+
+	return text:sub(bodyStart, bodyEnd), text:sub(bodyEnd + 1)
+end
+
 function onStdout(filetype)
 	return function (text)
-		if text:starts("Content-Length:") then
-			message = text
-		else
-			message = message .. text
-		end
-		if not text:ends("}") then
-			return
-		end	
-		local data = message:parse()
-		if data == false then
-			return
-		end
-
-		lspLog(filetype .. " <<< " .. (data.method or 'no method'))
-		
-		if data.method == "workspace/configuration" then
-		    -- actually needs to respond with the same ID as the received JSON
-			lspLog(filetype .. " <<< workspace/configuration params", data.params)
-			local message = fmt.Sprintf('{"jsonrpc": "2.0", "id": %.0f, "result": %s}', data.id, configurationResult(data.params))
-			lspLog(filetype .. " >>> workspace/configuration response", message)
-			shell.JobSend(cmd[filetype], fmt.Sprintf('Content-Length: %.0f\r\n\r\n%s', #message, message))
-		elseif data.method == "textDocument/publishDiagnostics" or data.method == "textDocument\\/publishDiagnostics" then
-			-- react to server-published event
-			local uri = data.params.uri
-			local diagnosticPath = diagnosticPathFromURI(uri)
-			local uriDiagnostics = {}
-			diagnosticsByPath[diagnosticPath] = uriDiagnostics
-			for _, diagnostic in ipairs(data.params.diagnostics) do
-				local type = buffer.MTInfo
-				if diagnostic.severity == 1 then
-					type = buffer.MTError
-				elseif diagnostic.severity == 2 then
-					type = buffer.MTWarning
-				end
-				local mstart = buffer.Loc(diagnostic.range.start.character, diagnostic.range.start.line)
-		            local mend = buffer.Loc(diagnostic.range["end"].character, diagnostic.range["end"].line)
-
-				if not isIgnoredMessage(diagnostic.message) then
-					local msg = buffer.NewMessage("lsp", diagnostic.message, mstart, mend, type)
-					table.insert(uriDiagnostics, msg)
-				end
+		stdoutBuffer[filetype] = (stdoutBuffer[filetype] or '') .. text
+		while true do
+			local payload, rest = nextLSPPayload(stdoutBuffer[filetype])
+			stdoutBuffer[filetype] = rest
+			if payload == nil then
+				return
 			end
 
-			local curPane = micro.CurPane()
-			if curPane ~= nil and curPane.Buf ~= nil and diagnosticPath == diagnosticPathFromBuf(curPane.Buf) then
-				syncBufferDiagnostics(curPane.Buf)
-			end
-		elseif not data.method and data.jsonrpc and data.id ~= nil then			-- react to custom action event
-			local bp = micro.CurPane()
-			local action = pendingActions[filetype] and pendingActions[filetype][tostring(data.id)]
-			if action and action.response then
-				lspLog("Received message for ", filetype, data)
-				lspLog(filetype .. " <<< response", " id=", data.id or "nil", " expected=", action.method)
-				pendingActions[filetype][tostring(data.id)] = nil
-				if data.error then
-					lspLog(filetype .. " <<< error", data.error)
-				end
-				action.response(bp, data)
-			end
-		elseif data.method == "window/showMessage" or data.method == "window\\/showMessage" then
-			if filetype == micro.CurPane().Buf:FileType() then
-				micro.InfoBar():Message(data.params.message)
+			local data = payload:parse()
+			if data == false then
+				traceLog("PARSE_FAILED", filetype, payload)
 			else
-				lspLog(filetype .. " message " .. data.params.message)
+				lspLog(filetype .. " <<< " .. (data.method or 'no method'))
+				
+				if data.method == "workspace/configuration" then
+				    -- actually needs to respond with the same ID as the received JSON
+					lspLog(filetype .. " <<< workspace/configuration params", data.params)
+					local message = fmt.Sprintf('{"jsonrpc": "2.0", "id": %.0f, "result": %s}', data.id, configurationResult(data.params))
+					lspLog(filetype .. " >>> workspace/configuration response", message)
+					shell.JobSend(cmd[filetype], fmt.Sprintf('Content-Length: %.0f\r\n\r\n%s', #message, message))
+				elseif data.method == "workspace/semanticTokens/refresh" or data.method == "workspace\\/semanticTokens\\/refresh" then
+					traceLog("SEMANTIC_REFRESH", filetype)
+					if data.id ~= nil then
+						local response = fmt.Sprintf('{"jsonrpc": "2.0", "id": %.0f, "result": null}', data.id)
+						shell.JobSend(cmd[filetype], fmt.Sprintf('Content-Length: %.0f\r\n\r\n%s', #response, response))
+					end
+					local curPane = micro.CurPane()
+					if curPane ~= nil and curPane.Buf ~= nil and curPane.Buf:FileType() == filetype and supportsSemanticTokens(filetype) then
+						requestSemanticTokensForBuf(curPane.Buf)
+					end
+				elseif data.method == "textDocument/publishDiagnostics" or data.method == "textDocument\\/publishDiagnostics" then
+					-- react to server-published event
+					local uri = data.params.uri
+					local diagnosticPath = diagnosticPathFromURI(uri)
+					local uriDiagnostics = {}
+					diagnosticsByPath[diagnosticPath] = uriDiagnostics
+					for _, diagnostic in ipairs(data.params.diagnostics) do
+						local type = buffer.MTInfo
+						if diagnostic.severity == 1 then
+							type = buffer.MTError
+						elseif diagnostic.severity == 2 then
+							type = buffer.MTWarning
+						end
+						local mstart = buffer.Loc(diagnostic.range.start.character, diagnostic.range.start.line)
+						local mend = buffer.Loc(diagnostic.range["end"].character, diagnostic.range["end"].line)
+
+						if not isIgnoredMessage(diagnostic.message) then
+							local msg = buffer.NewMessage("lsp", diagnostic.message, mstart, mend, type)
+							table.insert(uriDiagnostics, msg)
+						end
+					end
+					traceLog("DIAGNOSTICS", filetype, diagnosticPath or "nil", #uriDiagnostics)
+
+					local curPane = micro.CurPane()
+					if curPane ~= nil and curPane.Buf ~= nil and diagnosticPath == diagnosticPathFromBuf(curPane.Buf) then
+						syncBufferDiagnostics(curPane.Buf)
+						if supportsSemanticTokens(filetype) then
+							-- Pyrefly can report diagnostics before startup semantic tokens are ready,
+							-- so request highlights once diagnostics confirm the document is indexed.
+							local currentURI = getUriFromBuf(curPane.Buf)
+							local entry = semanticByPath[diagnosticPath]
+							if entry == nil or entry.version ~= version[currentURI] then
+								scheduleSemanticTokens(curPane)
+							end
+						end
+					end
+				elseif not data.method and data.jsonrpc and data.id ~= nil then
+					local bp = micro.CurPane()
+					local action = pendingActions[filetype] and pendingActions[filetype][tostring(data.id)]
+					if action and action.response then
+						lspLog("Received message for ", filetype, data)
+						lspLog(filetype .. " <<< response", " id=", data.id or "nil", " expected=", action.method)
+						pendingActions[filetype][tostring(data.id)] = nil
+						if data.error then
+							lspLog(filetype .. " <<< error", data.error)
+						end
+						action.response(bp, data)
+					end
+				elseif data.method == "window/showMessage" or data.method == "window\\/showMessage" then
+					traceLog("WINDOW_SHOW", filetype, data.params and data.params.message or "")
+					local curPane = micro.CurPane()
+					if curPane ~= nil and curPane.Buf ~= nil and filetype == curPane.Buf:FileType() then
+						infoMessage("window/showMessage", data.params.message)
+					else
+						lspLog(filetype .. " message " .. data.params.message)
+					end
+				elseif data.method == "window/logMessage" or data.method == "window\\/logMessage" then
+					traceLog("WINDOW_LOG", filetype, data.params and data.params.message or "")
+					lspLog(data.params.message)
+				else
+					traceLog("UNHANDLED_PAYLOAD", filetype, payload)
+				end
 			end
-		elseif data.method == "window/logMessage" or data.method == "window\\/logMessage" then
-			lspLog(data.params.message)
-		elseif message:starts("Content-Length:") then
-			if message:find('"') and not message:find('"result":null') then
-				lspLog("Unhandled message 1", filetype, message)
-			end
-		else
-			-- enable for debugging purposes
-			lspLog("Unhandled message 2", filetype, message)
 		end
 	end
 end
 
 function onStderr(text)
 	lspLog("ONSTDERR", text)
-	if not isIgnoredMessage(text) then
-		micro.InfoBar():Message(text)
+	traceLog("STDERR", text or "")
+	if text == nil or text == '' then
+		return
+	end
+
+	for line in string.gmatch(text, "([^\r\n]+)") do
+		local trimmed = line:match("^%s*(.-)%s*$") or ""
+		local lowered = string.lower(trimmed)
+		local isErrorLike = lowered:match("^error[:%s]") ~= nil
+			or lowered:match("^fatal[:%s]") ~= nil
+			or lowered:match("^panic[:%s]") ~= nil
+			or lowered:match("^traceback") ~= nil
+			or lowered:match("^exception[:%s]") ~= nil
+
+		if isErrorLike and not isIgnoredMessage(trimmed) then
+			errorMessage("stderr", trimmed)
+			return
+		end
 	end
 end
 
@@ -954,7 +1202,10 @@ function onExit(filetype)
 	return function (str)
 		pendingActions[filetype] = nil
 		cmd[filetype] = nil
+		stdoutBuffer[filetype] = nil
+		traceLog("ONEXIT", filetype, str or "")
 		lspLog("ONEXIT", filetype, str)
+		errorMessage("onExit", "LSP server for " .. filetype .. " exited unexpectedly")
 	end
 end
 
@@ -1010,10 +1261,9 @@ function definitionActionResponse(bp, data)
 	local doc = uri:gsub("^file://", ""):gsub('%%[a-f0-9][a-f0-9]', function(x, y, z) print("X", x); return string.char(tonumber(x:gsub('%%', ''), 16)) end)
 	local buf = bp.Buf
 	if file ~= doc then
-		-- it's from a different file, so open it as a new tab
+		-- Reuse the current pane when jumping across files.
 		buf, _ = buffer.NewBufferFromFile(doc)
-		bp:AddTab()
-		micro.CurPane():OpenBuffer(buf)
+		bp:OpenBuffer(buf)
 		-- shorten the displayed name in status bar
 		name = buf:GetName()
     	local wd, _ = go_os.Getwd()
@@ -1110,7 +1360,7 @@ function findCommon(input, list)
 end
 
 function jsonEscape(str)
-	return (str or ''):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t')
+	return ((str or ''):gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'):gsub('\t', '\\t'))
 end
 
 function jsonQuote(str)
@@ -1212,7 +1462,7 @@ function requestSemanticTokensForBuf(buf)
 	if buf == nil then
 		return
 	end
-	local filetype = buf:FileType()
+	local filetype = fileTypeFromBuf(buf)
 	if cmd[filetype] == nil or not supportsSemanticTokens(filetype) then
 		return
 	end
@@ -1227,15 +1477,22 @@ function requestSemanticTokensForBuf(buf)
 		method = "textDocument/semanticTokens/full",
 		response = function (_, data)
 			if version[uri] ~= requestedVersion then
+				traceLog("SEMANTIC_SKIP_VERSION", filetype, path or "nil", requestedVersion, version[uri] or -1)
+				return
+			end
+
+			local result = data.result
+			if result == nil or result.data == nil then
+				traceLog("SEMANTIC_EMPTY_RESULT", filetype, path or "nil", requestedVersion)
 				return
 			end
 
 			local payload = '[]'
-			local result = data.result
 			local provider = capabilities[filetype] and capabilities[filetype].semanticTokensProvider
-			if result ~= nil and result.data ~= nil and provider ~= nil and provider.legend ~= nil then
+			if provider ~= nil and provider.legend ~= nil then
 				payload = serializeSemanticSpans(decodeSemanticTokens(result.data, provider.legend, splitLines(util.String(buf:Bytes())), filetype))
 			end
+			traceLog("SEMANTIC_RESPONSE", filetype, path or "nil", result ~= nil and result.data ~= nil and (#result.data / 5) or 0, #payload)
 
 			semanticByPath[path] = {
 				version = requestedVersion,
@@ -1310,44 +1567,33 @@ function serializeCompletionItems(results)
 	return '[' .. table.join(out, ',') .. ']'
 end
 
-function isAutocompleteRune(r)
-	return r == '.' or (r and r:match('[%w_]') ~= nil)
-end
-
+-- Returns true if the text to the left of the cursor is a member access
+-- pattern like "foo.", "foo.bar", "foo.bar.baz", etc.
 function isMemberAccessContext(bp)
 	if bp == nil or bp.Buf == nil then
 		return false
 	end
 	local cur = bp.Buf:GetActiveCursor()
-	cur:SelectLine()
-	local lineContent = util.String(cur:GetSelection()):gsub("\r?\n$", "")
-	cur:ResetSelection()
-	cur:GotoLoc(buffer.Loc(cur.X, cur.Y))
-	local left = lineContent:sub(1, cur.X)
+	local left = util.String(bp.Buf:LineBytes(cur.Y)):sub(1, cur.X)
 	return left:match("[%w_]+%.[%w_]*$") ~= nil
-		or left:match("[%w_]+%.[%w_]+%.[%w_]*$") ~= nil
 end
 
+-- Decides whether typing a character should trigger LSP completions.
 function shouldAutoTriggerCompletion(bp, r)
 	if bp == nil or bp.Buf == nil then
 		return false
 	end
+	-- Dot always triggers (member access)
 	if r == '.' then
 		return true
 	end
+	-- Regular character: trigger if we're continuing a member access (e.g. typing "ba" after "foo.")
 	if r ~= nil then
 		return isMemberAccessContext(bp)
 	end
-	if not (bp.Buf.CompletionMenu or bp.Buf:HasGhostCompletion()) then
-		return false
-	end
-	if isMemberAccessContext(bp) then
-		return true
-	end
-	if bp.Buf:CurrentWordLength() > 0 then
-		return true
-	end
-	return false
+	-- Non-rune event (paste, undo): refresh if completions are already visible
+	return (bp.Buf.CompletionMenu or bp.Buf:HasGhostCompletion())
+		and (isMemberAccessContext(bp) or bp.Buf:CurrentWordLength() > 0)
 end
 
 function scheduleCompletionAction(bp)
@@ -1370,22 +1616,24 @@ function scheduleCompletionAction(bp)
 	end)
 end
 
-function scheduleSemanticTokens(bp)
-	if bp == nil or bp.Buf == nil then
+function scheduleSemanticTokens(target)
+	local buf = bufferFromTarget(target)
+	if buf == nil then
 		return
 	end
-	local file = bp.Buf.AbsPath or ''
+	local file = buf.AbsPath or ''
+	traceLog("SCHEDULE_SEMANTIC", fileTypeFromBuf(buf) or "nil", diagnosticPathFromBuf(buf) or "nil", semanticRequestToken[file] or 0)
 	semanticRequestToken[file] = (semanticRequestToken[file] or 0) + 1
 	local token = semanticRequestToken[file]
 	micro.After(semanticDebounceNs, function()
-		if bp == nil or bp.Buf == nil then
+		if buf == nil then
 			return
 		end
-		local currentFile = bp.Buf.AbsPath or ''
+		local currentFile = buf.AbsPath or ''
 		if semanticRequestToken[currentFile] ~= token then
 			return
 		end
-		requestSemanticTokensForBuf(bp.Buf)
+		requestSemanticTokensForBuf(buf)
 	end)
 end
 
@@ -1593,10 +1841,20 @@ end
 
 function onSetActive(bp)
 	if bp ~= nil then
+		local filetype = bp.Buf:FileType()
+		local uri = getUriFromBuf(bp.Buf)
+		if filetype ~= "unknown" then
+			if cmd[filetype] == nil then
+				startServer(bp.Buf, filetype, handleInitialized)
+				return
+			elseif uri ~= nil and version[uri] == nil then
+				handleInitialized(bp.Buf, filetype)
+			end
+		end
+
 		syncBufferDiagnostics(bp.Buf)
 		syncBufferSemanticHighlights(bp.Buf)
 		if supportsSemanticTokens(bp.Buf:FileType()) then
-			local uri = getUriFromBuf(bp.Buf)
 			local path = diagnosticPathFromBuf(bp.Buf)
 			local entry = semanticByPath[path]
 			if entry == nil or entry.version ~= version[uri] then

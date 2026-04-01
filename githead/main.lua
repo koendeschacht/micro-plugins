@@ -57,7 +57,7 @@ local function gitInfo(absPath)
     end
 
     if stateByPath[absPath] ~= nil then
-        return stateByPath[absPath]
+        return stateByPath[absPath] or nil
     end
 
     local root, rootErr = runCommand("git -C " .. shellQuote(parentDir(absPath)) .. " rev-parse --show-toplevel")
@@ -89,6 +89,10 @@ local function gitInfo(absPath)
 end
 
 local function headContents(info)
+    if type(info) ~= "table" then
+        return ""
+    end
+
     local output, err = runCommand("git -C " .. shellQuote(info.root) .. " cat-file -p " .. shellQuote("HEAD:" .. info.relPath))
     if err ~= nil then
         return ""

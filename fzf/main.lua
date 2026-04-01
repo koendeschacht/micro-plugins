@@ -4,11 +4,21 @@ local micro = import("micro")
 local config = import("micro/config")
 local shell = import("micro/shell")
 local buffer = import("micro/buffer")
+local go_os = import("os")
+local filepath = import("path/filepath")
 
 local fzfBin = os.getenv("HOME") .. "/config/micro_plugins/fzf/fzf"
 local fzfColors = "--color=bg:#222436,bg+:#2d3f76,fg:#c8d3f5,fg+:#c8d3f5,hl:#82aaff,hl+:#86e1fc," ..
     "border:#5f9dc3,preview-border:#5f9dc3,prompt:#ffc777,pointer:#ff757f,marker:#c099ff," ..
     "spinner:#86e1fc,info:#828bb8,header:#636da6"
+local lastQuery = ""
+local home = os.getenv("HOME") or ""
+local stateHome = os.getenv("XDG_STATE_HOME")
+if stateHome == nil or stateHome == "" then
+    stateHome = filepath.Join(home, ".local", "state")
+end
+local recentDir = filepath.Join(stateHome, "micro", "recent-files")
+local startupRoot, _ = go_os.Getwd()
 
 local function commandExists(cmd)
     local _, err = shell.RunCommand("sh -c 'command -v " .. cmd .. " >/dev/null 2>&1'")
@@ -31,13 +41,48 @@ local function shellQuote(text)
     return "'" .. string.gsub(text, "'", "'\\''") .. "'"
 end
 
+local function encodePath(path)
+    local parts = {}
+    for i = 1, #path do
+        local byte = string.byte(path, i)
+        if (byte >= 48 and byte <= 57) or (byte >= 65 and byte <= 90) or (byte >= 97 and byte <= 122) or byte == 45 or byte == 46 or byte == 95 then
+            parts[#parts + 1] = string.char(byte)
+        else
+            parts[#parts + 1] = string.format("=%02X", byte)
+        end
+    end
+    return table.concat(parts)
+end
+
+local function recentPath()
+    if startupRoot == nil or startupRoot == "" then
+        return filepath.Join(recentDir, "default.txt")
+    end
+    return filepath.Join(recentDir, encodePath(startupRoot) .. ".txt")
+end
+
+local function parseOutput(text)
+    local query, selection = text:match("^([^\n]*)\n?(.*)$")
+    if query == nil then
+        return "", ""
+    end
+
+    selection = (selection or ""):gsub("\n+$", "")
+    return query, selection
+end
+
 local function rankCommand(fileSearch)
-    local ranker = "awk '{ path = tolower($0); score = 10; " ..
-        "if (path ~ /(^|\\/)(src|app|lib)\\//) score = 0; " ..
-        "else if (path ~ /(^|\\/)(pkg|python)\\//) score = 1; " ..
+    local recent = recentPath()
+    local awkScript = "BEGIN { while ((getline line < recent) > 0) recent_rank[line] = ++recent_count; close(recent) } " ..
+        "{ path = tolower($0); score = 100; " ..
+        "if ($0 in recent_rank) score = recent_rank[$0] - 20; " ..
+        "if (path ~ /(^|\\/)(src|app|lib)\\//) score = score - 10; " ..
+        "else if (path ~ /(^|\\/)(pkg|python)\\//) score = score - 5; " ..
         "if (path ~ /(^|\\/)(tests?|__tests__|spec)\\// || path ~ /(_test\\.|_spec\\.|\\.test\\.|\\.spec\\.)/) score = score + 20; " ..
-        "printf \"%03d %s\\n\", score, $0; }'"
-    return fileSearch .. " | " .. ranker .. " | sort -k1,1n -k2,2 | cut -c5-"
+        "printf \"%04d %s\\n\", score, $0; }"
+    return fileSearch ..
+        " | awk -v recent=" .. shellQuote(recent) .. " " .. shellQuote(awkScript) ..
+        " | sort -k1,1n -k2,2 | cut -c6-"
 end
 
 function fzfOpen(bp)
@@ -54,7 +99,7 @@ function fzfOpen(bp)
     end
 
     local resultPath = os.tmpname()
-    local fzfCmd = '"' .. fzfBin .. '" --layout=reverse ' .. fzfColors
+    local fzfCmd = '"' .. fzfBin .. '" --layout=reverse --print-query --query=' .. shellQuote(lastQuery) .. ' ' .. fzfColors
     local shellCmd = "script -q -c " .. shellQuote(rankCommand(fileSearch) .. " | " .. fzfCmd .. " > " .. shellQuote(resultPath)) .. " /dev/null"
     local _, err = shell.RunInteractiveShell(shellCmd, false, false)
     local output = ""
@@ -64,10 +109,11 @@ function fzfOpen(bp)
         resultFile:close()
     end
     os.remove(resultPath)
+    local query, file = parseOutput(output)
+    lastQuery = query
     if err ~= nil then
         return
     end
-    local file = output:match("^%s*(.-)%s*$")
     if file == "" then
         return
     end

@@ -3,6 +3,7 @@ VERSION = "0.1.0"
 local micro = import("micro")
 local config = import("micro/config")
 local shell = import("micro/shell")
+local go_os = import("os")
 
 local function shellQuote(text)
     return "'" .. string.gsub(text, "'", "'\\''") .. "'"
@@ -14,16 +15,25 @@ local function commandExists(cmd)
 end
 
 local function copyToClipboard(text)
+    local shellPayload = "printf '%s' " .. shellQuote(text)
     local commands = {
-        "xclip -selection clipboard",
-        "wl-copy",
-        "pbcopy",
+        {
+            binary = "wl-copy",
+            command = "sh -c " .. shellQuote("nohup sh -c " .. shellQuote(shellPayload .. " | wl-copy") .. " </dev/null >/dev/null 2>&1 &"),
+        },
+        {
+            binary = "pbcopy",
+            command = "sh -c " .. shellQuote(shellPayload .. " | pbcopy"),
+        },
+        {
+            binary = "xclip",
+            command = "sh -c " .. shellQuote("nohup sh -c " .. shellQuote(shellPayload .. " | xclip -selection clipboard") .. " </dev/null >/dev/null 2>&1 &"),
+        },
     }
 
-    for _, command in ipairs(commands) do
-        local binary = command:match("^(%S+)")
-        if commandExists(binary) then
-            local _, err = shell.RunCommand("sh -c " .. shellQuote("printf '%s' " .. shellQuote(text) .. " | " .. command))
+    for _, candidate in ipairs(commands) do
+        if commandExists(candidate.binary) then
+            local _, err = shell.RunCommand(candidate.command)
             if err == nil then
                 return true
             end
@@ -140,7 +150,77 @@ function pytestRetry(bp)
     copyCommand("run_pytest.sh --retry")
 end
 
+function uvRunFile(bp)
+    local path = currentFile(bp)
+    if path == nil then
+        return
+    end
+
+    copyCommand("uv run " .. shellQuote(path))
+end
+
+function copyRelPath(bp)
+    local path = currentFile(bp)
+    if path == nil then
+        return
+    end
+
+    local relpath, err = shell.RunCommand("realpath --relative-to=. " .. shellQuote(path))
+    if err ~= nil then
+        copyCommand(path)
+        return
+    end
+
+    copyCommand(relpath:gsub("%s+$", ""))
+end
+
+function copyAbsPath(bp)
+    local path = currentFile(bp)
+    if path == nil then
+        return
+    end
+
+    copyCommand(path)
+end
+
+function kittyTerminal(bp)
+    if os.getenv("KITTY_WINDOW_ID") == nil or os.getenv("KITTY_WINDOW_ID") == "" then
+        micro.InfoBar():Error("pythondev: not running inside kitty")
+        return
+    end
+
+    if os.getenv("KITTY_LISTEN_ON") == nil or os.getenv("KITTY_LISTEN_ON") == "" then
+        micro.InfoBar():Error("pythondev: kitty remote control unavailable")
+        return
+    end
+
+    if not commandExists("kitty") then
+        micro.InfoBar():Error("pythondev: kitty command not found")
+        return
+    end
+
+    local cwd, cwdErr = go_os.Getwd()
+    if cwdErr ~= nil then
+        micro.InfoBar():Error("pythondev: could not determine working directory")
+        return
+    end
+
+    local output, err = shell.ExecCommand("kitty", "@", "launch", "--type=window", "--cwd=" .. cwd)
+    if err ~= nil then
+        local message = output
+        if message == nil or message == "" then
+            message = err.Error()
+        end
+        micro.InfoBar():Error("pythondev: " .. message)
+        return
+    end
+end
+
 function init()
+    config.MakeCommand("copyrelpath", copyRelPath, config.NoComplete)
+    config.MakeCommand("copyabspath", copyAbsPath, config.NoComplete)
+    config.MakeCommand("kittyterm", kittyTerminal, config.NoComplete)
+    config.MakeCommand("uvrunfile", uvRunFile, config.NoComplete)
     config.MakeCommand("pytestfile", pytestFile, config.NoComplete)
     config.MakeCommand("pytestnode", pytestNode, config.NoComplete)
     config.MakeCommand("pytestretry", pytestRetry, config.NoComplete)
