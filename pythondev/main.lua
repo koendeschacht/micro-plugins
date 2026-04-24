@@ -146,10 +146,6 @@ function pytestNode(bp)
     copyCommand("uv run pytest " .. shellQuote(nodeid))
 end
 
-function pytestRetry(bp)
-    copyCommand("run_pytest.sh --retry")
-end
-
 function uvRunFile(bp)
     local path = currentFile(bp)
     if path == nil then
@@ -223,12 +219,10 @@ function init()
     config.MakeCommand("uvrunfile", uvRunFile, config.NoComplete)
     config.MakeCommand("pytestfile", pytestFile, config.NoComplete)
     config.MakeCommand("pytestnode", pytestNode, config.NoComplete)
-    config.MakeCommand("pytestretry", pytestRetry, config.NoComplete)
     config.RegisterActionLabel("command:copyrelpath", "relative path")
     config.RegisterActionLabel("command:copyabspath", "absolute path")
     config.RegisterActionLabel("command:kittyterm", "terminal")
     config.RegisterActionLabel("command:uvrunfile", "run")
     config.RegisterActionLabel("command:pytestfile", "test file")
     config.RegisterActionLabel("command:pytestnode", "test function")
-    config.RegisterActionLabel("command:pytestretry", "test retry")
 end
