@@ -8,7 +8,6 @@ local util = import("micro/util")
 
 local OWNER = "git_diff"
 local LIST_BUFFER_NAME = "git_diff files"
-local PERF_LOG_PATH = os.getenv("HOME") .. "/config/micro/git_diff_perf.log"
 local BLAME_WIDTH = 40
 local BLAME_REFRESH_DEBOUNCE_NS = 150000000
 local BLAME_PALETTE = {
@@ -32,8 +31,6 @@ local refreshChangedFiles
 local bufferText
 local jsonString
 local tempFile
-local perfSwitchSeq = 0
-local perfContext = nil
 local blameVersionSeq = 0
 local blameSessionSeq = 0
 
@@ -47,53 +44,6 @@ end
 
 local function shellQuote(text)
     return "'" .. string.gsub(text, "'", "'\\''") .. "'"
-end
-
-local function perfNow()
-    return micro.NanoTime()
-end
-
-local function perfMs(startNs)
-    return (perfNow() - startNs) / 1000000
-end
-
-local function perfLog(message)
-    local f = io.open(PERF_LOG_PATH, "a")
-    if f == nil then
-        return
-    end
-    f:write(os.date("%Y-%m-%d %H:%M:%S"), " ", message, "\n")
-    f:close()
-end
-
-local function summarizeCommand(command)
-    command = command:gsub("%s+", " ")
-    if #command > 180 then
-        return command:sub(1, 177) .. "..."
-    end
-    return command
-end
-
-local function setPerfContext(kind, path)
-    perfSwitchSeq = perfSwitchSeq + 1
-    perfContext = {
-        id = perfSwitchSeq,
-        kind = kind,
-        path = path,
-        startNs = perfNow(),
-    }
-    perfLog(string.format("context start id=%d kind=%s path=%s", perfContext.id, kind, path or ""))
-end
-
-local function perfContextTag()
-    if perfContext == nil then
-        return "ctx=none"
-    end
-    return string.format("ctx=%d kind=%s path=%s age_ms=%.1f", perfContext.id, perfContext.kind, perfContext.path or "", perfMs(perfContext.startNs))
-end
-
-local function shouldLogCallback()
-    return perfContext ~= nil and perfMs(perfContext.startNs) < 3000
 end
 
 local function trim(text)
@@ -128,9 +78,7 @@ local function parentDir(path)
 end
 
 local function runCommand(command)
-    local startNs = perfNow()
     local output, err = shell.RunCommand("sh -c " .. shellQuote(command))
-    perfLog(string.format("runCommand ms=%.1f ok=%s cmd=%s", perfMs(startNs), err == nil and "true" or "false", summarizeCommand(command)))
     if err ~= nil then
         return nil, err
     end
@@ -717,7 +665,6 @@ tempFile = function(text)
 end
 
 local function diffTextForContents(targetText, currentText)
-    local startNs = perfNow()
     local targetPath = tempFile(targetText)
     local currentPath = tempFile(currentText)
     if targetPath == nil or currentPath == nil then
@@ -734,7 +681,6 @@ local function diffTextForContents(targetText, currentText)
     local text, err = shell.RunCommand("sh -c " .. shellQuote(command .. "; code=$?; test $code -eq 0 -o $code -eq 1"))
     os.remove(targetPath)
     os.remove(currentPath)
-    perfLog(string.format("diffTextForContents ms=%.1f ok=%s", perfMs(startNs), err == nil and "true" or "false"))
     if err ~= nil then
         return nil, "git_diff: could not compute diff"
     end
@@ -742,7 +688,6 @@ local function diffTextForContents(targetText, currentText)
 end
 
 local function wordDiffTextForContents(targetText, currentText)
-    local startNs = perfNow()
     local targetPath = tempFile(targetText)
     local currentPath = tempFile(currentText)
     if targetPath == nil or currentPath == nil then
@@ -759,7 +704,6 @@ local function wordDiffTextForContents(targetText, currentText)
     local text, err = shell.RunCommand("sh -c " .. shellQuote(command .. "; code=$?; test $code -eq 0 -o $code -eq 1"))
     os.remove(targetPath)
     os.remove(currentPath)
-    perfLog(string.format("wordDiffTextForContents ms=%.1f ok=%s", perfMs(startNs), err == nil and "true" or "false"))
     if err ~= nil then
         return nil, "git_diff: could not compute word diff"
     end
@@ -1025,13 +969,11 @@ local function ensureSessionBuffer(buf)
 end
 
 local function applyOverlay(buf)
-    local totalStartNs = perfNow()
     local ok, relPath = ensureSessionBuffer(buf)
     if not ok then
         return
     end
 
-    local stepStartNs = perfNow()
     local currentText = bufferText(buf)
 
     local targetText = session.targetTextCache[relPath]
@@ -1039,7 +981,6 @@ local function applyOverlay(buf)
         targetText = trackedContents(session.root, session.target, relPath)
         session.targetTextCache[relPath] = targetText
     end
-    perfLog(string.format("applyOverlay step=buffer-and-target path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 
     local cacheKey = currentText
     local overlay = session.overlayCache[relPath]
@@ -1051,50 +992,39 @@ local function applyOverlay(buf)
 		buf:SetVirtualLineDecorationsJSON(OWNER, overlay.virtualLineDecorationsJSON, session.version)
 		session.cache[buf.AbsPath] = cacheKey
 		session.touched[buf.AbsPath] = buf
-		perfLog(string.format("applyOverlay path=%s cached=overlay total_ms=%.1f", relPath, perfMs(totalStartNs)))
 		return
 	end
 
     if session.cache[buf.AbsPath] == cacheKey and session.touched[buf.AbsPath] == buf then
-		perfLog(string.format("applyOverlay path=%s cached=buffer total_ms=%.1f", relPath, perfMs(totalStartNs)))
         return
     end
 
-    stepStartNs = perfNow()
     local diffText, diffErr = diffTextForContents(targetText, currentText)
     if diffErr ~= nil then
         micro.InfoBar():Error(diffErr)
         return
     end
-    perfLog(string.format("applyOverlay step=diff path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 
-    stepStartNs = perfNow()
     local wordDiffText, wordDiffErr = wordDiffTextForContents(targetText, currentText)
     if wordDiffErr ~= nil then
         micro.InfoBar():Error(wordDiffErr)
         return
     end
-    perfLog(string.format("applyOverlay step=worddiff path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 
-    stepStartNs = perfNow()
     local decorationsJSON, virtualLinesJSON, virtualLineDecorationsJSON = buildOverlayJSON(parseDiff(diffText), parseWordDiff(wordDiffText), buf)
-	perfLog(string.format("applyOverlay step=build-overlay path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 	session.overlayCache[relPath] = {
 		cacheKey = cacheKey,
 		decorationsJSON = decorationsJSON,
 		virtualLinesJSON = virtualLinesJSON,
 		virtualLineDecorationsJSON = virtualLineDecorationsJSON,
 	}
-	stepStartNs = perfNow()
     buf:SetDiffBase(targetText)
     buf:SetOptionNative("diffgutter", true)
     buf:SetDecorationsJSON(OWNER, decorationsJSON, session.version)
     buf:SetVirtualLinesJSON(OWNER, virtualLinesJSON, session.version)
     buf:SetVirtualLineDecorationsJSON(OWNER, virtualLineDecorationsJSON, session.version)
-    perfLog(string.format("applyOverlay step=apply-buffer-state path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
     session.cache[buf.AbsPath] = cacheKey
     session.touched[buf.AbsPath] = buf
-    perfLog(string.format("applyOverlay path=%s cached=false total_ms=%.1f", relPath, perfMs(totalStartNs)))
 end
 
 local function clearTouchedBuffers()
@@ -1478,12 +1408,9 @@ local function targetPaneForOpen(originPane)
 end
 
 openSessionFile = function(originPane, relPath)
-    local totalStartNs = perfNow()
     if session == nil or relPath == nil then
         return false
     end
-
-    setPerfContext("openSessionFile", relPath)
 
     local targetPane = targetPaneForOpen(originPane)
     if targetPane == nil then
@@ -1492,28 +1419,19 @@ openSessionFile = function(originPane, relPath)
     end
 
     local absPath = session.root .. "/" .. relPath
-    local stepStartNs = perfNow()
     local buf, err = buffer.NewBufferFromFile(absPath)
-    perfLog(string.format("openSessionFile step=open-buffer path=%s ms=%.1f ok=%s", relPath, perfMs(stepStartNs), err == nil and "true" or "false"))
     if err ~= nil then
         micro.InfoBar():Error("git_diff: could not open " .. relPath)
         return false
     end
 
-    stepStartNs = perfNow()
     targetPane:PushJump()
     targetPane:OpenBuffer(buf)
-    perfLog(string.format("openSessionFile step=open-pane path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 
-    stepStartNs = perfNow()
     applyOverlay(buf)
-    perfLog(string.format("openSessionFile step=apply-overlay path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
 
-    stepStartNs = perfNow()
     gotoFirstChange(targetPane)
     refreshChangedFiles()
-    perfLog(string.format("openSessionFile step=post-open path=%s ms=%.1f", relPath, perfMs(stepStartNs)))
-    perfLog(string.format("openSessionFile path=%s total_ms=%.1f", relPath, perfMs(totalStartNs)))
     return true
 end
 
@@ -1614,7 +1532,6 @@ local function ensureListPane(bp, lines)
 end
 
 refreshChangedFiles = function()
-    local totalStartNs = perfNow()
     if session == nil then
         return
     end
@@ -1627,7 +1544,6 @@ refreshChangedFiles = function()
     local text = listBufferText(lines)
     local activeRelPath = currentSessionRelPath()
     if session.listText == text and session.listActiveRelPath == activeRelPath then
-        perfLog(string.format("refreshChangedFiles changed=false total_ms=%.1f", perfMs(totalStartNs)))
         return
     end
 
@@ -1635,14 +1551,12 @@ refreshChangedFiles = function()
         session.listActiveRelPath = activeRelPath
         local decorationsJSON = listDecorationsJSON(splitLines(text))
         session.listPane.Buf:SetDecorationsJSON(OWNER, decorationsJSON, session.version)
-        perfLog(string.format("refreshChangedFiles changed=decorations-only total_ms=%.1f", perfMs(totalStartNs)))
         return
     end
 
     session.listText = text
     session.listActiveRelPath = activeRelPath
     ensureListPane(sourcePane() or currentPane(), lines)
-    perfLog(string.format("refreshChangedFiles changed=full total_ms=%.1f", perfMs(totalStartNs)))
 end
 
 local function startSession(bp, target, label)
@@ -1711,10 +1625,6 @@ local function refreshSessionPane(bp)
 end
 
 function onBufferOpen(buf)
-    local startNs = perfNow()
-    if shouldLogCallback() then
-        perfLog(string.format("callback=onBufferOpen start %s buf=%s", perfContextTag(), buf ~= nil and (buf.AbsPath or buf:GetName()) or ""))
-    end
     if session ~= nil and repoFile(buf.AbsPath) ~= nil and not isListBuffer(buf) then
         local curPane = currentPane()
         if curPane ~= nil and curPane.Buf == buf then
@@ -1729,16 +1639,9 @@ function onBufferOpen(buf)
     if curPane ~= nil and curPane.Buf == buf then
         syncBlameForPane(curPane, false)
     end
-    if shouldLogCallback() then
-        perfLog(string.format("callback=onBufferOpen end %s ms=%.1f", perfContextTag(), perfMs(startNs)))
-    end
 end
 
 function onSetActive(bp)
-    local startNs = perfNow()
-    if shouldLogCallback() then
-        perfLog(string.format("callback=onSetActive start %s buf=%s", perfContextTag(), bp ~= nil and bp.Buf ~= nil and (bp.Buf.AbsPath or bp.Buf:GetName()) or ""))
-    end
     if bp == nil or bp.Buf == nil then
         return
     end
@@ -1755,9 +1658,6 @@ function onSetActive(bp)
         syncHeadDiffBase(bp.Buf)
     end
     syncBlameForPane(bp, false)
-    if shouldLogCallback() then
-        perfLog(string.format("callback=onSetActive end %s ms=%.1f", perfContextTag(), perfMs(startNs)))
-    end
 end
 
 function preInsertNewline(bp)
@@ -1781,12 +1681,6 @@ function onSave(bp)
 end
 
 function onAnyEvent()
-    local startNs = perfNow()
-    local logThis = shouldLogCallback()
-    if logThis then
-        local bp = currentPane()
-        perfLog(string.format("callback=onAnyEvent start %s buf=%s", perfContextTag(), bp ~= nil and bp.Buf ~= nil and (bp.Buf.AbsPath or bp.Buf:GetName()) or ""))
-    end
     local bp = currentPane()
     if bp == nil or bp.Buf == nil or isListBuffer(bp.Buf) then
         return
@@ -1806,9 +1700,6 @@ function onAnyEvent()
     if session.sourcePane ~= bp or session.listActiveRelPath ~= relPath then
         session.sourcePane = bp
         refreshChangedFiles()
-    end
-    if logThis then
-        perfLog(string.format("callback=onAnyEvent end %s ms=%.1f", perfContextTag(), perfMs(startNs)))
     end
 end
 
