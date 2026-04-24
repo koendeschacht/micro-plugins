@@ -300,9 +300,9 @@ local function reloadOpenBuffers()
     local skipped = 0
     local failed = 0
 
-    for _, tab in ipairs(tabs.List) do
+    for _, tab in tabs.List() do
         if tab ~= nil and tab.Panes ~= nil then
-            for _, pane in ipairs(tab.Panes) do
+            for _, pane in tab.Panes() do
                 if pane ~= nil and pane.Buf ~= nil and seen[pane.Buf] == nil then
                     seen[pane.Buf] = true
 
