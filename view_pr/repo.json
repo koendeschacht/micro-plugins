@@ -1,0 +1,14 @@
+[{ 
+  "Name": "view_pr",
+  "Description": "Open a GitHub PR in git_diff",
+  "Tags": ["git", "github", "pr"],
+  "Versions": [
+    {
+      "Version": "0.1.1",
+      "Url": "",
+      "Require": {
+        "micro": ">=2.0.8"
+      }
+    }
+  ]
+}]

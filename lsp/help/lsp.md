@@ -10,9 +10,10 @@ This help page can be viewed in Micro editor with Ctrl-E 'help lsp'
 - Show function signature on status bar (alt-K) (textDocument/hover)
 - Open function definition in a new tab (alt-D) (textDocument/definition)
 - Format document (alt-F) (textDocument/formatting)
-- Show references to the current symbol in a buffer (alt-R)
-  (textDocument/references), pressing return on the reference line, the
-  reference's location is opened in a new tab
+- Restart the current language server (`lsprestart`, bound to `Ctrl-k c q`)
+- Show references to the current symbol (alt-R) (textDocument/references).
+  When `fzf` and `batcat`/`bat` are available this opens the same picker-style
+  UI with preview; otherwise it falls back to the references split buffer.
 
 There is initial support for completion (ctrl-space) (textDocument/completion).
 

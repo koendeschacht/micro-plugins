@@ -1,0 +1,14 @@
+[{ 
+  "Name": "llm_help",
+  "Description": "Scratch chat pane for LLM help",
+  "Tags": ["llm", "ai", "openai", "help"],
+  "Versions": [
+    {
+      "Version": "0.1.0",
+      "Url": "",
+      "Require": {
+        "micro": ">=2.0.8"
+      }
+    }
+  ]
+}]

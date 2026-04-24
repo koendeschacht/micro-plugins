@@ -1,0 +1,14 @@
+[{ 
+  "Name": "search_and_replace",
+  "Description": "Popup-like file and project search for micro",
+  "Tags": ["search", "ripgrep"],
+  "Versions": [
+    {
+      "Version": "0.1.0",
+      "Url": "",
+      "Require": {
+        "micro": ">=2.0.8"
+      }
+    }
+  ]
+}]

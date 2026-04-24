@@ -1,6 +1,7 @@
 VERSION = "0.1.0"
 
 local buffer = import("micro/buffer")
+local config = import("micro/config")
 local util = import("micro/util")
 
 local snippetsByFiletype = {
@@ -68,4 +69,8 @@ function expand(bp)
     bp.Buf:insert(start, body)
     bp.Cursor:GotoLoc(endLoc(start, body))
     return true
+end
+
+function init()
+    config.RegisterActionLabel("lua:templates.expand", "template")
 end

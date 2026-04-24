@@ -15,6 +15,8 @@ local recentDir = filepath.Join(stateHome, "micro", "recent-files")
 local startupRoot, _ = go_os.Getwd()
 local maxEntries = 10
 local startupHandled = false
+local _recentList = nil
+local _recentDirty = false
 
 local function shellQuote(text)
     return "'" .. string.gsub(text, "'", "'\\''") .. "'"
@@ -105,6 +107,15 @@ local function writeRecentFiles(entries)
     file:close()
 end
 
+local function flushRecentFiles()
+    if _recentList == nil or not _recentDirty then
+        return
+    end
+
+    writeRecentFiles(_recentList)
+    _recentDirty = false
+end
+
 local function rememberFile(path)
     if not isFile(path) then
         return
@@ -115,9 +126,17 @@ local function rememberFile(path)
         return
     end
 
+    if _recentList == nil then
+        _recentList = readRecentFiles()
+    end
+
+    if _recentList[1] == relPath then
+        return
+    end
+
     local seen = { [relPath] = true }
     local entries = { relPath }
-    for _, entry in ipairs(readRecentFiles()) do
+    for _, entry in ipairs(_recentList) do
         if not seen[entry] then
             table.insert(entries, entry)
             seen[entry] = true
@@ -126,7 +145,15 @@ local function rememberFile(path)
             break
         end
     end
-    writeRecentFiles(entries)
+    _recentList = entries
+    _recentDirty = true
+end
+
+function recentfiles_getList()
+    if _recentList == nil then
+        _recentList = readRecentFiles()
+    end
+    return _recentList
 end
 
 local function shouldRestoreRecent(bp)
@@ -140,6 +167,18 @@ end
 
 function onBufferOpen(buf)
     rememberFile(buf.AbsPath)
+end
+
+function onSetActive(bp)
+    if bp == nil or bp.Buf == nil then
+        return
+    end
+
+    rememberFile(bp.Buf.AbsPath)
+end
+
+function deinit()
+    flushRecentFiles()
 end
 
 function onAnyEvent()

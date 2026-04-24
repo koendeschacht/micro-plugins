@@ -20,6 +20,7 @@ local startupRoot, _ = go_os.Getwd()
 local rootUri = ''
 local completionCursor = 0
 local lastCompletion = {}
+local referencesLastQuery = ''
 local splitBP = nil
 local refOriginPane = nil
 local completionRequestToken = {}
@@ -31,6 +32,8 @@ local semanticByPath = {}
 local stdoutBuffer = {}
 local tempFileCounter = 0
 local startErrorByFiletype = {}
+local restartRequestByFiletype = {}
+local suppressExitMessageByFiletype = {}
 
 local documentChangeDebounceNs = 60 * 1000000
 local completionDebounceNs = 75 * 1000000
@@ -271,6 +274,393 @@ local function workspaceRoot()
 	end
 	local wd, _ = go_os.Getwd()
 	return wd
+end
+
+local function executableExists(name)
+	if name == nil or name == '' then
+		return false
+	end
+
+	local _, err = shell.RunCommand("sh -c " .. shellQuote("test -x " .. shellQuote(name)))
+	return err == nil
+end
+
+local function displayPath(pathstr)
+	if pathstr == nil or pathstr == '' then
+		return ''
+	end
+
+	local root = workspaceRoot()
+	if root ~= nil and root ~= '' then
+		if pathstr == root then
+			return "."
+		end
+
+		local prefix = root .. "/"
+		if pathstr:sub(1, #prefix) == prefix then
+			return "." .. pathstr:sub(#root + 1)
+		end
+	end
+
+	return pathstr
+end
+
+local function trimReferenceSnippet(text)
+	if text == nil then
+		return ''
+	end
+
+	text = text:gsub("\t", "    ")
+	text = text:gsub("%s+", " ")
+	text = text:gsub("^%s+", "")
+	text = text:gsub("%s+$", "")
+	if #text > 160 then
+		return text:sub(1, 157) .. "..."
+	end
+	return text
+end
+
+local function readReferenceLines(pathstr, cache)
+	if pathstr == nil or pathstr == '' then
+		return {}
+	end
+
+	if cache[pathstr] == nil then
+		local lines = {}
+		local file = io.open(pathstr, "r")
+		if file ~= nil then
+			local idx = 0
+			for line in file:lines() do
+				lines[idx] = line
+				idx = idx + 1
+			end
+			file:close()
+		end
+		cache[pathstr] = lines
+	end
+
+	return cache[pathstr]
+end
+
+local function readReferenceLine(pathstr, targetLine, cache)
+	if pathstr == nil or pathstr == '' or targetLine == nil or targetLine < 0 then
+		return ''
+	end
+
+	local lines = readReferenceLines(pathstr, cache)
+	return lines[targetLine] or ''
+end
+
+local function readReferenceSnippet(pathstr, targetLine, cache)
+	return trimReferenceSnippet(readReferenceLine(pathstr, targetLine, cache))
+end
+
+local function luaPatternEscape(text)
+	if text == nil then
+		return ''
+	end
+	return (text:gsub("([%(%)%.%%%+%-%*%?%[%]%^%$])", "%%%1"))
+end
+
+local function isWordChar(ch)
+	return ch ~= nil and ch ~= '' and ch:match("[%w_]") ~= nil
+end
+
+local function referenceIdentifier(line, character)
+	if line == nil or line == '' then
+		return nil
+	end
+
+	local idx = math.max(1, math.min(#line, (character or 0) + 1))
+	if not isWordChar(line:sub(idx, idx)) and idx > 1 and isWordChar(line:sub(idx - 1, idx - 1)) then
+		idx = idx - 1
+	end
+	if not isWordChar(line:sub(idx, idx)) then
+		return nil
+	end
+
+	local startIdx = idx
+	while startIdx > 1 and isWordChar(line:sub(startIdx - 1, startIdx - 1)) do
+		startIdx = startIdx - 1
+	end
+	local endIdx = idx
+	while endIdx < #line and isWordChar(line:sub(endIdx + 1, endIdx + 1)) do
+		endIdx = endIdx + 1
+	end
+	return line:sub(startIdx, endIdx)
+end
+
+local function isImportLine(trimmed)
+	return trimmed:match("^import%s+") ~= nil or
+		trimmed:match("^from%s+.+%s+import%s+") ~= nil or
+		trimmed:match("^import%s*{%s*$") ~= nil or
+		trimmed:match("^export%s+{%s*$") ~= nil or
+		trimmed:match("^export%s+type%s+{%s*$") ~= nil or
+		trimmed:match("^export%s+.*%s+from%s+['\"]") ~= nil or
+		trimmed:match("^const%s+.+=%s*require%s*%(") ~= nil or
+		trimmed:match("^let%s+.+=%s*require%s*%(") ~= nil or
+		trimmed:match("^var%s+.+=%s*require%s*%(") ~= nil or
+		trimmed:match("^local%s+.+=%s*require%s*%(") ~= nil
+end
+
+local function isImportReference(pathstr, targetLine, cache)
+	local line = readReferenceLine(pathstr, targetLine, cache)
+	local trimmed = line:match("^%s*(.-)%s*$") or ''
+	if isImportLine(trimmed) then
+		return true
+	end
+
+	for delta = 1, 8 do
+		local prev = readReferenceLine(pathstr, targetLine - delta, cache)
+		local prevTrimmed = prev:match("^%s*(.-)%s*$") or ''
+		if prevTrimmed == '' then
+			break
+		end
+		if prevTrimmed:match("^from%s+.+%s+import%s*%($") or
+			prevTrimmed:match("^import%s*{%s*$") or
+			prevTrimmed:match("^export%s+{%s*$") or
+			prevTrimmed:match("^export%s+type%s+{%s*$") then
+			return true
+		end
+	end
+
+	for delta = 1, 3 do
+		local nextLine = readReferenceLine(pathstr, targetLine + delta, cache)
+		local nextTrimmed = nextLine:match("^%s*(.-)%s*$") or ''
+		if nextTrimmed == '' then
+			break
+		end
+		if nextTrimmed:match("^}%s*from%s+['\"]") ~= nil then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function isDefinitionReference(pathstr, targetLine, character, cache)
+	local line = readReferenceLine(pathstr, targetLine, cache)
+	local trimmed = line:match("^%s*(.-)%s*$") or ''
+	local ident = referenceIdentifier(line, character)
+	if ident == nil or ident == '' then
+		return false
+	end
+
+	local name = luaPatternEscape(ident)
+	local patterns = {
+		"^async%s+def%s+" .. name .. "[%s%(]",
+		"^def%s+" .. name .. "[%s%(]",
+		"^class%s+" .. name .. "[%s%(:]",
+		"^local%s+function%s+" .. name .. "[%s%(]",
+		"^function%s+.*" .. name .. "[%s%(]",
+		"^async%s+function%s+" .. name .. "[%s%(]",
+		"^function%s+" .. name .. "[%s%(]",
+		"^func%s+" .. name .. "[%s%(]",
+		"^func%s+%b()%s*" .. name .. "[%s%(]",
+		"^type%s+" .. name .. "[%s={]",
+		"^interface%s+" .. name .. "[%s{]",
+		"^enum%s+" .. name .. "[%s{]",
+		"^class%s+" .. name .. "[%s{]",
+		"^const%s+" .. name .. "[%s=:]",
+		"^let%s+" .. name .. "[%s=:]",
+		"^var%s+" .. name .. "[%s=:]",
+		"^local%s+" .. name .. "[%s=:]",
+	}
+
+	for _, pattern in ipairs(patterns) do
+		if trimmed:match(pattern) ~= nil then
+			return true
+		end
+	end
+
+	return false
+end
+
+local function normalizeReferences(results)
+	local cache = {}
+	local normalized = {}
+	for idx, ref in ipairs(results) do
+		local uri = ref.uri or ref.targetUri
+		local refRange = ref.range or ref.targetSelectionRange
+		local doc = diagnosticPathFromURI(uri)
+		if doc ~= nil and refRange ~= nil and refRange.start ~= nil then
+			local line = refRange.start.line or 0
+			local character = refRange.start.character or 0
+			if not isDefinitionReference(doc, line, character, cache) then
+				table.insert(normalized, {
+					doc = doc,
+					line = line,
+					character = character,
+					display = displayPath(doc),
+					snippet = readReferenceSnippet(doc, line, cache),
+					isImport = isImportReference(doc, line, cache),
+					order = idx,
+				})
+			end
+		end
+	end
+
+	table.sort(normalized, function(left, right)
+		if left.isImport ~= right.isImport then
+			return not left.isImport
+		end
+		return left.order < right.order
+	end)
+
+	return normalized
+end
+
+local function parseCommandOutput(text)
+	local query, selection = text:match("^([^\n]*)\n?(.*)$")
+	if query == nil then
+		return "", ""
+	end
+
+	selection = (selection or ""):gsub("\n+$", "")
+	return query, selection
+end
+
+local function referenceFzfBin()
+	local home, _ = go_os.Getenv("HOME")
+	home = home or ''
+	local candidates = {
+		filepath.Join(home, "config", "micro_plugins", "fzfgrep", "fzf"),
+		filepath.Join(home, "config", "micro_plugins", "fzf", "fzf"),
+	}
+
+	for _, candidate in ipairs(candidates) do
+		if executableExists(candidate) then
+			return candidate
+		end
+	end
+
+	if commandExists("fzf", workspaceRoot()) then
+		return "fzf"
+	end
+
+	return nil
+end
+
+local function referencePreviewBin()
+	if commandExists("batcat", workspaceRoot()) then
+		return "batcat"
+	end
+	if commandExists("bat", workspaceRoot()) then
+		return "bat"
+	end
+	return nil
+end
+
+local function openReferenceLocation(bp, doc, line, character)
+	if bp == nil or doc == nil or doc == '' then
+		return
+	end
+
+	local newBuf, err = buffer.NewBufferFromFile(doc)
+	if err ~= nil then
+		micro.InfoBar():Error("LSP: could not open " .. doc)
+		return
+	end
+
+	bp:PushJump()
+	bp:OpenBuffer(newBuf)
+	newBuf:GetActiveCursor():GotoLoc(buffer.Loc(math.max(0, character or 0), math.max(0, line or 0)))
+	bp:Center()
+	if bp.Relocate then
+		bp:Relocate()
+	end
+end
+
+local function showReferencesSplit(bp, refs)
+	local msg = ''
+	for _idx, ref in ipairs(refs) do
+		if msg ~= '' then msg = msg .. '\n'; end
+		msg = msg .. ref.display .. ":" .. ref.line .. ":" .. ref.character
+	end
+
+	refOriginPane = bp
+	local logBuf = buffer.NewBuffer(msg, "References found")
+	splitBP = bp:HSplitBuf(logBuf)
+end
+
+local function showReferencesPicker(bp, refs)
+	local fzfBin = referenceFzfBin()
+	local previewBin = referencePreviewBin()
+	if fzfBin == nil or previewBin == nil then
+		return false
+	end
+
+	local inputPath = os.tmpname()
+	local resultPath = os.tmpname()
+	local inputFile = io.open(inputPath, "w")
+	if inputFile == nil then
+		return false
+	end
+
+	local count = 0
+	for _, ref in ipairs(refs) do
+		local line = ref.line + 1
+		local character = ref.character + 1
+		local text = string.format("%s:%d:%d", ref.display, line, character)
+		if ref.snippet ~= '' then
+			text = text .. " " .. ref.snippet
+		end
+		inputFile:write(table.concat({ ref.doc, tostring(line), tostring(character), text }, "\t") .. "\n")
+		count = count + 1
+	end
+	inputFile:close()
+
+	if count == 0 then
+		os.remove(inputPath)
+		os.remove(resultPath)
+		return false
+	end
+
+	local previewLines = 40
+	if bp ~= nil and bp.BWindow ~= nil and bp.BWindow.Height ~= nil then
+		previewLines = math.max(10, bp.BWindow.Height - 1)
+	end
+
+	local previewCmd = "sh -c " .. shellQuote(
+		"line=\"$2\"; lines=" .. previewLines .. "; half=$(( lines / 2 )); " ..
+		"start=$(( line > half ? line - half : 1 )); end=$(( start + lines - 1 )); " ..
+		previewBin .. " --color=always --style=numbers --line-range \"${start}:${end}\" " ..
+		"--highlight-line \"$line\" \"$1\""
+	) .. " sh {1} {2}"
+	local fzfCmd = shellQuote(fzfBin) ..
+		" --layout=reverse --border --info=inline --print-query --delimiter='\\t' --with-nth=4.." ..
+		" --query=" .. shellQuote(referencesLastQuery) ..
+		" --prompt='Refs> ' --border-label=' references ' " ..
+		" --preview=" .. shellQuote(previewCmd) ..
+		" --preview-window=right:55%,border-left"
+	local shellCmd = "script -q -c " .. shellQuote(fzfCmd .. " < " .. shellQuote(inputPath) .. " > " .. shellQuote(resultPath)) .. " /dev/null"
+	local _, err = shell.RunInteractiveShell(shellCmd, false, false)
+
+	local output = ""
+	local resultFile = io.open(resultPath, "r")
+	if resultFile ~= nil then
+		output = resultFile:read("*a") or ""
+		resultFile:close()
+	end
+	os.remove(inputPath)
+	os.remove(resultPath)
+
+	local query, selection = parseCommandOutput(output)
+	referencesLastQuery = query
+	if err ~= nil or selection == '' then
+		return true
+	end
+
+	local doc, line, character = selection:match("^([^\t]+)\t(%d+)\t(%d+)\t")
+	if doc == nil then
+		micro.InfoBar():Error("LSP: could not parse selected reference")
+		return true
+	end
+
+	micro.After(0, function()
+		openReferenceLocation(bp, doc, line * 1 - 1, character * 1 - 1)
+	end)
+	return true
 end
 
 local function shellCommand(runCmd, args)
@@ -639,6 +1029,44 @@ function startServer(buf, filetype, callback)
 	end
 end
 
+local function startServerForBuf(buf, filetype, action)
+	startServer(buf, filetype, function(startedBuf, startedFiletype)
+		handleInitialized(startedBuf, startedFiletype)
+		if action ~= nil then
+			action(startedFiletype)
+		end
+	end)
+end
+
+function restartAction(bp)
+	if bp == nil or bp.Buf == nil then
+		return
+	end
+
+	local filetype = bp.Buf:FileType()
+	if filetype == nil or filetype == "" or filetype == "unknown" then
+		errorMessage("restart", "LSP: no configured server for this buffer")
+		return
+	end
+
+	if restartRequestByFiletype[filetype] ~= nil then
+		infoMessage("restart", "LSP server restart already in progress for " .. filetype)
+		return
+	end
+
+	if cmd[filetype] == nil then
+		startServerForBuf(bp.Buf, filetype, function(startedFiletype)
+			infoMessage("restart", "Started LSP server for " .. startedFiletype)
+		end)
+		return
+	end
+
+	restartRequestByFiletype[filetype] = { buf = bp.Buf }
+	suppressExitMessageByFiletype[filetype] = true
+	infoMessage("restart", "Restarting LSP server for " .. filetype)
+	shell.JobStop(cmd[filetype])
+end
+
 function init()
 	config.RegisterCommonOption("lsp", "server", "python=pylsp,go=gopls,typescript=deno lsp,javascript=deno lsp,markdown=deno lsp,json=deno lsp,jsonc=deno lsp,rust=rust-analyzer,lua=lua-language-server,c++=clangd,dart=dart language-server")
 	config.RegisterCommonOption("lsp", "formatOnSave", false)
@@ -655,10 +1083,20 @@ function init()
 	
 	config.MakeCommand("hover", hoverAction, config.NoComplete)
 	config.MakeCommand("definition", definitionAction, config.NoComplete)
+	config.MakeCommand("smartreference", smartReferenceAction, config.NoComplete)
 	config.MakeCommand("lspcompletion", completionAction, config.NoComplete)
 	config.MakeCommand("format", formatAction, config.NoComplete)
 	config.MakeCommand("references", referencesAction, config.NoComplete)
 	config.MakeCommand("rename", renameAction, config.NoComplete)
+	config.MakeCommand("lsprestart", restartAction, config.NoComplete)
+	config.RegisterActionLabel("command:hover", "hover")
+	config.RegisterActionLabel("command:definition", "definition")
+	config.RegisterActionLabel("command:smartreference", "smart reference")
+	config.RegisterActionLabel("command:lspcompletion", "completion")
+	config.RegisterActionLabel("command:format", "format")
+	config.RegisterActionLabel("command:references", "references")
+	config.RegisterActionLabel("command:rename", "rename")
+	config.RegisterActionLabel("command:lsprestart", "restart lsp")
 
 	config.TryBindKey("Alt-k", "command:hover", false)
 	config.TryBindKey("Alt-d", "command:definition", false)
@@ -811,6 +1249,36 @@ function onRune(bp, r)
 	end
 end
 
+local function noteDocumentMutation(buf)
+	if buf == nil then
+		return
+	end
+
+	local filetype = fileTypeFromBuf(buf)
+	if cmd[filetype] == nil then
+		return
+	end
+
+	closeSplitPane()
+	lastCompletion = {}
+
+	local uri = getUriFromBuf(buf)
+	if uri == nil then
+		return
+	end
+
+	version[uri] = (version[uri] or 0) + 1
+	traceLog("MANUAL_TEXT_EVENT", filetype, diagnosticPathFromBuf(buf) or "nil", version[uri])
+	local path = diagnosticPathFromBuf(buf)
+	if path ~= nil then
+		semanticByPath[path] = nil
+	end
+	scheduleDidChange(buf)
+	if supportsSemanticTokens(filetype) then
+		scheduleSemanticTokens(buf)
+	end
+end
+
 -- alias functions for any kind of change to the document
 function onMoveLinesUp(bp) onRune(bp) end
 function onMoveLinesDown(bp) onRune(bp) end
@@ -821,8 +1289,14 @@ function onInsertSpace(bp) onRune(bp) end
 function onBackspace(bp) onRune(bp) end
 function onDelete(bp) onRune(bp) end
 function onInsertTab(bp) onRune(bp) end
-function onUndo(bp) onRune(bp) end
-function onRedo(bp) onRune(bp) end
+function onUndo(bp)
+	noteDocumentMutation(bp.Buf)
+	onRune(bp)
+end
+function onRedo(bp)
+	noteDocumentMutation(bp.Buf)
+	onRune(bp)
+end
 function onCut(bp) onRune(bp) end
 function onCutLine(bp) onRune(bp) end
 function onDuplicateLine(bp) onRune(bp) end
@@ -876,15 +1350,9 @@ function preInsertNewline(bp)
 		local cur = bp.Buf:GetActiveCursor()
 		cur:SelectLine()
 		local data = util.String(cur:GetSelection())
-		local file, line, character = data:match("(./[^:]+):([^:]+):([^:]+)")
-		local doc, _ = file:gsub("^file://", "")
-		local newBuf, _ = buffer.NewBufferFromFile(doc)
-		-- Record position in the origin pane before navigating
+		local doc, line, character = data:match("([^:]+):([^:]+):([^:]+)")
 		if refOriginPane ~= nil then
-			refOriginPane:PushJump()
-			refOriginPane:OpenBuffer(newBuf)
-			newBuf:GetActiveCursor():GotoLoc(buffer.Loc(character * 1, line * 1))
-			refOriginPane:Center()
+			openReferenceLocation(refOriginPane, doc, line * 1, character * 1)
 		end
 		return false
 	end
@@ -1200,11 +1668,30 @@ end
 
 function onExit(filetype)
 	return function (str)
+		local restartRequest = restartRequestByFiletype[filetype]
+		local suppressExitMessage = suppressExitMessageByFiletype[filetype]
 		pendingActions[filetype] = nil
 		cmd[filetype] = nil
+		id[filetype] = nil
+		capabilities[filetype] = nil
 		stdoutBuffer[filetype] = nil
 		traceLog("ONEXIT", filetype, str or "")
 		lspLog("ONEXIT", filetype, str)
+		if restartRequest ~= nil then
+			restartRequestByFiletype[filetype] = nil
+			suppressExitMessageByFiletype[filetype] = nil
+			startServerForBuf(restartRequest.buf, filetype, function(startedFiletype)
+				if supportsSemanticTokens(startedFiletype) then
+					scheduleSemanticTokens(restartRequest.buf)
+				end
+				infoMessage("restart", "Restarted LSP server for " .. startedFiletype)
+			end)
+			return
+		end
+		suppressExitMessageByFiletype[filetype] = nil
+		if suppressExitMessage then
+			return
+		end
 		errorMessage("onExit", "LSP server for " .. filetype .. " exited unexpectedly")
 	end
 end
@@ -1234,6 +1721,13 @@ function hoverActionResponse(buf, data)
 end
 
 -- the definition action request and response
+local function sendDefinitionRequest(filetype, file, line, char, response)
+	withSend(filetype)("textDocument/definition", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, {
+		method = "textDocument/definition",
+		response = response,
+	})
+end
+
 function definitionAction(bp)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
@@ -1241,11 +1735,10 @@ function definitionAction(bp)
 	micro.PushJump()
 	flushPendingDidChangeForBuf(bp.Buf)
 
-	local send = withSend(filetype)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
-	send("textDocument/definition", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, { method = "textDocument/definition", response = definitionActionResponse })
+	sendDefinitionRequest(filetype, file, line, char, definitionActionResponse)
 end
 
 function definitionActionResponse(bp, data)
@@ -1278,6 +1771,45 @@ function definitionActionResponse(bp, data)
 	local range = results[1].range or results[1].targetSelectionRange
 	buf:GetActiveCursor():GotoLoc(buffer.Loc(range.start.character, range.start.line))
 	bp:Center()
+end
+
+local function definitionResultList(data)
+	local results = data.result or data.partialResult
+	if results == nil then
+		return nil
+	end
+	if results.uri ~= nil then
+		return { results }
+	end
+	return results
+end
+
+local function definitionMatchesPosition(data, file, line, character)
+	local results = definitionResultList(data)
+	if results == nil or #results <= 0 then
+		return false
+	end
+
+	local target = results[1]
+	local uri = target.uri or target.targetUri
+	local range = target.range or target.targetSelectionRange
+	local doc = diagnosticPathFromURI(uri)
+	if doc == nil or range == nil or range.start == nil or range['end'] == nil then
+		return false
+	end
+	if doc ~= file then
+		return false
+	end
+	if line < range.start.line or line > range['end'].line then
+		return false
+	end
+	if line == range.start.line and character < range.start.character then
+		return false
+	end
+	if line == range['end'].line and character >= range['end'].character then
+		return false
+	end
+	return true
 end
 
 function completionAction(bp)
@@ -1437,6 +1969,7 @@ function decodeSemanticTokens(data, legend, lines, filetype)
 				line = line,
 				start = start,
 				length = length,
+				rawGroup = group,
 				group = normalizeSemanticTokenGroup(group, tokenText, filetype, line, start, parameterInfo),
 			})
 		end
@@ -1488,15 +2021,18 @@ function requestSemanticTokensForBuf(buf)
 			end
 
 			local payload = '[]'
+			local spans = {}
 			local provider = capabilities[filetype] and capabilities[filetype].semanticTokensProvider
 			if provider ~= nil and provider.legend ~= nil then
-				payload = serializeSemanticSpans(decodeSemanticTokens(result.data, provider.legend, splitLines(util.String(buf:Bytes())), filetype))
+				spans = decodeSemanticTokens(result.data, provider.legend, splitLines(util.String(buf:Bytes())), filetype)
+				payload = serializeSemanticSpans(spans)
 			end
 			traceLog("SEMANTIC_RESPONSE", filetype, path or "nil", result ~= nil and result.data ~= nil and (#result.data / 5) or 0, #payload)
 
 			semanticByPath[path] = {
 				version = requestedVersion,
 				payload = payload,
+				spans = spans,
 			}
 
 			local curPane = micro.CurPane()
@@ -1505,6 +2041,126 @@ function requestSemanticTokensForBuf(buf)
 			end
 		end,
 	})
+end
+
+local function isDefinitionLikeToken(span)
+	if span == nil or span.rawGroup == nil then
+		return false
+	end
+	return span.rawGroup:match("(^|%.)definition(%.|$)") ~= nil or span.rawGroup:match("(^|%.)declaration(%.|$)") ~= nil
+end
+
+local function currentWordRange(bp)
+	if bp == nil or bp.Buf == nil then
+		return nil
+	end
+
+	local cur = bp.Buf:GetActiveCursor()
+	local line = util.String(bp.Buf:LineBytes(cur.Y))
+	if line == '' then
+		return nil
+	end
+
+	local pos = math.max(1, math.min(#line, cur.X + 1))
+	if not isWordChar(line:sub(pos, pos)) and pos > 1 and isWordChar(line:sub(pos - 1, pos - 1)) then
+		pos = pos - 1
+	end
+	if not isWordChar(line:sub(pos, pos)) then
+		return nil
+	end
+
+	local startPos = pos
+	while startPos > 1 and isWordChar(line:sub(startPos - 1, startPos - 1)) do
+		startPos = startPos - 1
+	end
+
+	local endPos = pos
+	while endPos < #line and isWordChar(line:sub(endPos + 1, endPos + 1)) do
+		endPos = endPos + 1
+	end
+
+	return {
+		line = cur.Y,
+		start = startPos - 1,
+		finish = endPos,
+	}
+end
+
+local function definitionLikeTokenForRange(entry, line, startX, endX)
+	if entry == nil or entry.spans == nil then
+		return nil
+	end
+
+	for _, span in ipairs(entry.spans) do
+		if span.line == line and isDefinitionLikeToken(span) then
+			local spanEnd = span.start + span.length
+			if span.start < endX and startX < spanEnd then
+				return span
+			end
+		end
+	end
+
+	return nil
+end
+
+local function definitionLikeTokenAtCursor(bp)
+	if bp == nil or bp.Buf == nil then
+		return nil
+	end
+
+	local path = diagnosticPathFromBuf(bp.Buf)
+	if path == nil then
+		return nil
+	end
+
+	local entry = semanticByPath[path]
+	if entry == nil or entry.spans == nil then
+		return nil
+	end
+
+	local cur = bp.Buf:GetActiveCursor()
+	local span = definitionLikeTokenForRange(entry, cur.Y, cur.X, cur.X + 1)
+	if span ~= nil then
+		return span
+	end
+
+	if cur.X > 0 then
+		span = definitionLikeTokenForRange(entry, cur.Y, cur.X - 1, cur.X)
+		if span ~= nil then
+			return span
+		end
+	end
+
+	local word = currentWordRange(bp)
+	if word == nil then
+		return nil
+	end
+
+	return definitionLikeTokenForRange(entry, word.line, word.start, word.finish)
+end
+
+function smartReferenceAction(bp)
+	if definitionLikeTokenAtCursor(bp) ~= nil then
+		referencesAction(bp)
+		return
+	end
+
+	local filetype = bp.Buf:FileType()
+	if cmd[filetype] == nil then return; end
+
+	flushPendingDidChangeForBuf(bp.Buf)
+	local file = bp.Buf.AbsPath
+	local line = bp.Buf:GetActiveCursor().Y
+	local char = bp.Buf:GetActiveCursor().X
+	local originPane = bp
+	sendDefinitionRequest(filetype, file, line, char, function (_, data)
+		if definitionMatchesPosition(data, file, line, char) then
+			referencesAction(originPane)
+			return
+		end
+		micro.PushJump()
+		definitionActionResponse(originPane, data)
+	end)
 end
 
 function normalizeInsertText(entry)
@@ -1735,26 +2391,28 @@ function referencesAction(bp)
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
-	send("textDocument/references", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "context": {"includeDeclaration":true}}', file, line, char), false, { method = "textDocument/references", response = referencesActionResponse })
+	local originPane = bp
+	send("textDocument/references", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "context": {"includeDeclaration":false}}', file, line, char), false, { method = "textDocument/references", response = function (_, data)
+		referencesActionResponse(originPane, data)
+	end })
 end
 
 function referencesActionResponse(bp, data)
-	if data.result == nil then return; end
-	local results = data.result or data.partialResult
-	if results == nil or #results <= 0 then return; end
-
-	local file = bp.Buf.AbsPath
-	
-	local msg = ''
-	for _idx, ref in ipairs(results) do
-		if msg ~= '' then msg = msg .. '\n'; end
-		local doc = (ref.uri or ref.targetUri)
-		msg = msg .. "." .. doc:sub(#rootUri + 1, #doc) .. ":" .. ref.range.start.line .. ":" .. ref.range.start.character
+	local results = normalizeReferences(data.result or data.partialResult or {})
+	if results == nil or #results <= 0 then
+		micro.InfoBar():Message("LSP: no references found")
+		return
 	end
 
-	refOriginPane = bp
-	local logBuf = buffer.NewBuffer(msg, "References found")
-	splitBP = bp:HSplitBuf(logBuf)
+	closeSplitPane()
+	if #results == 1 then
+		openReferenceLocation(bp, results[1].doc, results[1].line, results[1].character)
+		return
+	end
+	if showReferencesPicker(bp, results) then
+		return
+	end
+	showReferencesSplit(bp, results)
 end
 
 -- the rename action request and response

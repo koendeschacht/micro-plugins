@@ -84,6 +84,7 @@ function fzfGrep(bp)
     local rgPrefix = "rg --smart-case --line-number --no-heading --color=always " ..
         "--colors \"path:fg:130,170,255\" --colors \"line:fg:255,199,119\" " ..
         "--colors \"match:fg:200,211,245\" --colors \"match:style:nobold\" " ..
+        "--hidden --no-ignore " ..
         "--glob \"!.git\" --glob \"!node_modules\" --glob \"!.venv\" " ..
         "--glob \"!venv\" --glob \"!dist\" --glob \"!build\" " ..
         "--glob \"!__pycache__\" --glob \"!.mypy_cache\" -- "
@@ -151,5 +152,6 @@ end
 
 function init()
     config.MakeCommand("fzfgrep", fzfGrep, config.NoComplete)
+    config.RegisterActionLabel("command:fzfgrep", "grep")
     config.TryBindKey("Alt-g", "command:fzfgrep", false)
 end

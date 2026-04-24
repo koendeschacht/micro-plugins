@@ -1,0 +1,14 @@
+[{ 
+  "Name": "git_diff",
+  "Description": "Git diff viewer for Micro",
+  "Tags": ["git", "diff"],
+  "Versions": [
+    {
+      "Version": "0.3.20",
+      "Url": "",
+      "Require": {
+        "micro": ">=2.0.8"
+      }
+    }
+  ]
+}]

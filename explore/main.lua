@@ -80,5 +80,6 @@ end
 
 function init()
     config.MakeCommand("explore", shellExplore, config.NoComplete)
+    config.RegisterActionLabel("command:explore", "explore")
     config.TryBindKey("Ctrl-o", "command:explore", false)
 end

@@ -26,12 +26,18 @@ local function commandExists(cmd)
 end
 
 local function fileSearchCommand()
+    local flags = "--type f --hidden --no-ignore" ..
+        " --exclude .git --exclude node_modules --exclude .venv" ..
+        " --exclude venv --exclude dist --exclude build" ..
+        " --exclude __pycache__ --exclude .mypy_cache" ..
+        " --exclude .ruff_cache --exclude .hypothesis" ..
+        " --exclude '*.pyc'"
     if commandExists("fd") then
-        return "fd --type f"
+        return "fd " .. flags
     end
 
     if commandExists("fdfind") then
-        return "fdfind --type f"
+        return "fdfind " .. flags
     end
 
     return nil
@@ -71,17 +77,18 @@ local function parseOutput(text)
     return query, selection
 end
 
-local function rankCommand(fileSearch)
-    local recent = recentPath()
+local function rankCommand(fileSearch, recentFile)
     local awkScript = "BEGIN { while ((getline line < recent) > 0) recent_rank[line] = ++recent_count; close(recent) } " ..
-        "{ path = tolower($0); score = 100; " ..
-        "if ($0 in recent_rank) score = recent_rank[$0] - 20; " ..
-        "if (path ~ /(^|\\/)(src|app|lib)\\//) score = score - 10; " ..
+        "{ display = $0; sub(/^\\.\\//, \"\", display); path = tolower(display); score = 100; " ..
+        "if (display in recent_rank) score = recent_rank[display]; " ..
+        "else { " ..
+        "if (path ~ /(^|\\/)(app|lib)\\//) score = score - 10; " ..
         "else if (path ~ /(^|\\/)(pkg|python)\\//) score = score - 5; " ..
         "if (path ~ /(^|\\/)(tests?|__tests__|spec)\\// || path ~ /(_test\\.|_spec\\.|\\.test\\.|\\.spec\\.)/) score = score + 20; " ..
-        "printf \"%04d %s\\n\", score, $0; }"
+        "} " ..
+        "printf \"%04d %s\\n\", score, display; }"
     return fileSearch ..
-        " | awk -v recent=" .. shellQuote(recent) .. " " .. shellQuote(awkScript) ..
+        " | awk -v recent=" .. shellQuote(recentFile) .. " " .. shellQuote(awkScript) ..
         " | sort -k1,1n -k2,2 | cut -c6-"
 end
 
@@ -98,9 +105,26 @@ function fzfOpen(bp)
         return
     end
 
+    if recentfiles == nil or recentfiles.recentfiles_getList == nil then
+        micro.InfoBar():Error("fzf: recentfiles plugin is unavailable")
+        return
+    end
+
+    local list = recentfiles.recentfiles_getList()
+    local tempRecentFile = os.tmpname()
+    local f = io.open(tempRecentFile, "w")
+    if f == nil then
+        micro.InfoBar():Error("fzf: could not prepare recent file list")
+        return
+    end
+    for _, entry in ipairs(list) do
+        f:write(entry .. "\n")
+    end
+    f:close()
+
     local resultPath = os.tmpname()
-    local fzfCmd = '"' .. fzfBin .. '" --layout=reverse --print-query --query=' .. shellQuote(lastQuery) .. ' ' .. fzfColors
-    local shellCmd = "script -q -c " .. shellQuote(rankCommand(fileSearch) .. " | " .. fzfCmd .. " > " .. shellQuote(resultPath)) .. " /dev/null"
+    local fzfCmd = '"' .. fzfBin .. '" --layout=reverse --tiebreak=index --print-query --query=' .. shellQuote(lastQuery) .. ' ' .. fzfColors
+    local shellCmd = "script -q -c " .. shellQuote(rankCommand(fileSearch, tempRecentFile) .. " | " .. fzfCmd .. " > " .. shellQuote(resultPath)) .. " /dev/null"
     local _, err = shell.RunInteractiveShell(shellCmd, false, false)
     local output = ""
     local resultFile = io.open(resultPath, "r")
@@ -109,6 +133,9 @@ function fzfOpen(bp)
         resultFile:close()
     end
     os.remove(resultPath)
+    if tempRecentFile ~= nil then
+        os.remove(tempRecentFile)
+    end
     local query, file = parseOutput(output)
     lastQuery = query
     if err ~= nil then
@@ -133,5 +160,6 @@ end
 
 function init()
     config.MakeCommand("fzf", fzfOpen, config.NoComplete)
+    config.RegisterActionLabel("command:fzf", "files")
     config.TryBindKey("Ctrl-p", "command:fzf", false)
 end

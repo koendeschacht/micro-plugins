@@ -18,6 +18,8 @@ end
 function init()
     config.MakeCommand("jnextdiag", jnextDiagnostic, config.NoComplete)
     config.MakeCommand("jprevdiag", jprevDiagnostic, config.NoComplete)
+    config.RegisterActionLabel("command:jnextdiag", "next diag")
+    config.RegisterActionLabel("command:jprevdiag", "prev diag")
     config.TryBindKey("Alt-j", "command:jnextdiag", false)
     config.TryBindKey("Alt-J", "command:jprevdiag", false)
 end
