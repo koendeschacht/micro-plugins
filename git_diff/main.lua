@@ -244,16 +244,6 @@ local function blameColorGroup(commit)
     return BLAME_PALETTE[(total % #BLAME_PALETTE) + 1]
 end
 
-local function blameShortCommit(commit)
-    if commit == nil or commit == "" then
-        return "????????"
-    end
-    if commit:match("^0+$") then
-        return "WORKTREE"
-    end
-    return commit:sub(1, 8)
-end
-
 local function blameDate(entry)
     if entry.authorTime == nil then
         return "??????????"
@@ -267,7 +257,7 @@ local function blameHeaderText(entry)
         author = "unknown"
     end
 
-    return blameShortCommit(entry.commit) .. " " .. author .. " " .. blameDate(entry)
+    return blameDate(entry) .. " " .. author
 end
 
 local function blameSummaryText(entry)
@@ -1078,10 +1068,13 @@ function gitDiffBlame(bp)
     end
 
     local previous = blame
-    local sessionID = nextBlameSessionID()
     if previous ~= nil and previous.pane == bp then
-        sessionID = previous.sessionID
+        dropBlame()
+        micro.InfoBar():Message("git_diff: closed blame session")
+        return
     end
+
+    local sessionID = nextBlameSessionID()
 
     if renderBlame(bp, sessionID, true) then
         if previous ~= nil and previous.pane ~= bp then
@@ -1091,16 +1084,6 @@ function gitDiffBlame(bp)
     end
 
     blame = previous
-end
-
-function gitDiffBlameClose(bp)
-    if blame == nil then
-        micro.InfoBar():Message("git_diff: no active blame session")
-        return
-    end
-
-    dropBlame()
-    micro.InfoBar():Message("git_diff: closed blame session")
 end
 
 local function activeResetTarget(bp)
@@ -1722,7 +1705,6 @@ end
 function init()
     config.MakeCommand("gitdiffclose", gitDiffClose, config.NoComplete)
     config.MakeCommand("gitdiffblame", gitDiffBlame, config.NoComplete)
-    config.MakeCommand("gitdiffblameclose", gitDiffBlameClose, config.NoComplete)
     config.MakeCommand("gitdiffnext", gitDiffNext, config.NoComplete)
     config.MakeCommand("gitdiffprev", gitDiffPrevious, config.NoComplete)
     config.MakeCommand("gitdiffresethunk", resetHunk, config.NoComplete)
@@ -1730,8 +1712,7 @@ function init()
     config.MakeCommand("gitdiffworktree", diffViewWorktree, config.NoComplete)
     config.MakeCommand("gitdifftarget", diffViewTarget, config.NoComplete)
     config.RegisterActionLabel("command:gitdiffclose", "close diff")
-    config.RegisterActionLabel("command:gitdiffblame", "show blame")
-    config.RegisterActionLabel("command:gitdiffblameclose", "close blame")
+    config.RegisterActionLabel("command:gitdiffblame", "toggle blame")
     config.RegisterActionLabel("command:gitdiffnext", "next diff")
     config.RegisterActionLabel("command:gitdiffprev", "prev diff")
     config.RegisterActionLabel("command:gitdiffresethunk", "reset hunk")

@@ -8,6 +8,7 @@ local go_os = import("os")
 local filepath = import("path/filepath")
 
 local fzfBin = os.getenv("HOME") .. "/config/micro_plugins/fzfgrep/fzf"
+local batTheme = "TokyoNight Moon.micro"
 local fzfColors = "--color=bg:#222436,bg+:#2d3f76,fg:#c8d3f5,fg+:#c8d3f5,hl:#82aaff,hl+:#86e1fc," ..
     "border:#5f9dc3,preview-border:#5f9dc3,prompt:#ffc777,pointer:#ff757f,marker:#c099ff," ..
     "spinner:#86e1fc,info:#828bb8,header:#636da6"
@@ -99,7 +100,7 @@ function fzfGrep(bp)
     local reloadCmd = "sh -c " .. shellQuote(reloadScript) .. " sh {q}"
     local previewCmd = "sh -c 'line=\"$2\"; lines=" .. previewLines .. "; half=$(( lines / 2 )); " ..
         "start=$(( line > half ? line - half : 1 )); end=$(( start + lines - 1 )); " ..
-        "batcat --color=always --style=numbers --line-range \"${start}:${end}\" " ..
+        "batcat --theme=\"" .. batTheme .. "\" --color=always --style=numbers --line-range \"${start}:${end}\" " ..
         "--highlight-line \"$line\" \"$1\"' sh {1} {2}"
     local fzfCmd = '"' .. fzfBin .. '" --ansi --disabled --layout=reverse --border ' ..
         '--print-query --query=' .. shellQuote(lastQuery) .. ' ' ..

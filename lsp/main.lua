@@ -28,16 +28,20 @@ local semanticRequestToken = {}
 local changeRequestToken = {}
 local pendingDidChange = {}
 local diagnosticsByPath = {}
+local codeActionDiagnosticsByPath = {}
 local semanticByPath = {}
 local stdoutBuffer = {}
 local tempFileCounter = 0
 local startErrorByFiletype = {}
 local restartRequestByFiletype = {}
 local suppressExitMessageByFiletype = {}
+local pendingPythonFormat = {}
 
 local documentChangeDebounceNs = 60 * 1000000
 local completionDebounceNs = 75 * 1000000
 local semanticDebounceNs = 600 * 1000000
+local quickFixKey = "Ctrl-."
+local autoImportHint = "Press " .. quickFixKey .. " to auto-import or quick fix"
 
 local function lspLog(...)
 	local ok, enabled = pcall(config.GetGlobalOption, "lsp.debug")
@@ -154,6 +158,35 @@ local function diagnosticPathFromBuf(buf)
 		return nil
 	end
 	return buf.AbsPath
+end
+
+local function missingNameFromDiagnostic(msg)
+	if msg == nil then
+		return nil
+	end
+	msg = msg:gsub("\n" .. autoImportHint, "")
+	msg = msg:gsub("\nPress Ctrl%-r to auto%-import", "")
+
+	local patterns = {
+		"Could not find name [`'\"]?([%a_][%w_]*)",
+		"Undefined name [`'\"]?([%a_][%w_]*)",
+		"[`'\"]([%a_][%w_]*)[`'\"] is not defined",
+		"Name [`'\"]([%a_][%w_]*)[`'\"] is not defined",
+	}
+	for _, pattern in ipairs(patterns) do
+		local name = msg:match(pattern)
+		if name ~= nil and name ~= "" then
+			return name
+		end
+	end
+	return nil
+end
+
+local function diagnosticMessageForDisplay(filetype, msg)
+	if filetype == "python" and missingNameFromDiagnostic(msg) ~= nil and not msg:find(autoImportHint, 1, true) then
+		return msg .. "\n" .. autoImportHint
+	end
+	return msg
 end
 
 local function syncBufferDiagnostics(buf)
@@ -624,7 +657,7 @@ local function showReferencesPicker(bp, refs)
 	local previewCmd = "sh -c " .. shellQuote(
 		"line=\"$2\"; lines=" .. previewLines .. "; half=$(( lines / 2 )); " ..
 		"start=$(( line > half ? line - half : 1 )); end=$(( start + lines - 1 )); " ..
-		previewBin .. " --color=always --style=numbers --line-range \"${start}:${end}\" " ..
+		previewBin .. " --theme='TokyoNight Moon.micro' --color=always --style=numbers --line-range \"${start}:${end}\" " ..
 		"--highlight-line \"$line\" \"$1\""
 	) .. " sh {1} {2}"
 	local fzfCmd = shellQuote(fzfBin) ..
@@ -735,6 +768,49 @@ local function externalPythonFormat(bp, callback)
 	if err ~= nil then
 		go_os.Remove(tmpName)
 		micro.InfoBar():Message("Could not write temporary file: " .. err:Error())
+		return true
+	end
+
+	if callback == nil then
+		if pendingPythonFormat[bp.Buf] ~= nil then
+			go_os.Remove(tmpName)
+			micro.InfoBar():Message("Python format already in progress")
+			return true
+		end
+
+		local wasReadonly = bp.Buf.Settings["readonly"]
+		pendingPythonFormat[bp.Buf] = true
+		bp.Buf:SetOptionNative("readonly", true)
+		micro.InfoBar():Message("Formatting with Ruff...")
+
+		local function onFormatExit(output, args)
+			local formatBP = args[1]
+			local formattedPath = args[2]
+			local originalText = args[3]
+			local originallyReadonly = args[4]
+
+			pendingPythonFormat[formatBP.Buf] = nil
+			formatBP.Buf:SetOptionNative("readonly", originallyReadonly)
+
+			local formatted, readErr = go_os.ReadFile(formattedPath)
+			go_os.Remove(formattedPath)
+			if readErr ~= nil then
+				micro.InfoBar():Message("Could not read formatted output: " .. readErr:Error())
+				return
+			end
+
+			if output ~= nil and output ~= '' then
+				micro.InfoBar():Message("Ruff format failed: " .. output)
+				return
+			end
+
+			local formattedText = util.String(formatted)
+			if formattedText ~= originalText then
+				replaceWholeBuffer(formatBP, formattedText)
+			end
+		end
+
+		shell.JobSpawn(formatter, {"format", tmpName}, nil, nil, onFormatExit, bp, tmpName, util.String(content), wasReadonly)
 		return true
 	end
 
@@ -1018,7 +1094,7 @@ function startServer(buf, filetype, callback)
 				return
 			end
 			cmd[part[1]] = job
-			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true}}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}, "semanticTokens": {"augmentsSyntaxTokens": true, "requests": {"full": true}, "tokenTypes": %s, "tokenModifiers": %s, "formats": ["relative"], "overlappingTokenSupport": false, "multilineTokenSupport": false}}}}', go_os.Getpid(), rootUri, rootUri, initOptions, jsonStringArray(semanticTokenTypes), jsonStringArray(semanticTokenModifiers)), false, { method = "initialize", response = function (_, data)
+			send("initialize", fmt.Sprintf('{"processId": %.0f, "rootUri": "%s", "workspaceFolders": [{"name": "root", "uri": "%s"}], "initializationOptions": %s, "capabilities": {"workspace": {"configuration": true}, "textDocument": {"completion": {"completionItem": {"documentationFormat": ["plaintext", "markdown"], "preselectSupport": true, "deprecatedSupport": true, "resolveSupport": {"properties": ["additionalTextEdits", "detail", "documentation"]}}}, "codeAction": {"codeActionLiteralSupport": {"codeActionKind": {"valueSet": ["", "quickfix", "refactor", "refactor.extract", "refactor.inline", "refactor.move", "refactor.rewrite", "refactor.delete", "source", "source.fixAll", "source.organizeImports"]}}, "dataSupport": true, "resolveSupport": {"properties": ["edit", "command"]}}, "definition": {"linkSupport": true}, "typeDefinition": {"linkSupport": true}, "hover": {"contentFormat": ["plaintext", "markdown"]}, "publishDiagnostics": {"relatedInformation": false, "versionSupport": false, "codeDescriptionSupport": true, "dataSupport": true}, "signatureHelp": {"signatureInformation": {"documentationFormat": ["plaintext", "markdown"]}}, "semanticTokens": {"augmentsSyntaxTokens": true, "requests": {"full": true}, "tokenTypes": %s, "tokenModifiers": %s, "formats": ["relative"], "overlappingTokenSupport": false, "multilineTokenSupport": false}}}}', go_os.Getpid(), rootUri, rootUri, initOptions, jsonStringArray(semanticTokenTypes), jsonStringArray(semanticTokenModifiers)), false, { method = "initialize", response = function (_, data)
 			    send("initialized", "{}", true)
 				capabilities[filetype] = data.result and data.result.capabilities or {}
 				traceLog("INITIALIZED", filetype, "semanticTokensProvider", capabilities[filetype].semanticTokensProvider ~= nil)
@@ -1089,6 +1165,7 @@ function init()
 	config.MakeCommand("references", referencesAction, config.NoComplete)
 	config.MakeCommand("rename", renameAction, config.NoComplete)
 	config.MakeCommand("lsprestart", restartAction, config.NoComplete)
+	config.MakeCommand("lspquickfix", quickFixAction, config.NoComplete)
 	config.RegisterActionLabel("command:hover", "hover")
 	config.RegisterActionLabel("command:definition", "definition")
 	config.RegisterActionLabel("command:smartreference", "smart reference")
@@ -1097,12 +1174,14 @@ function init()
 	config.RegisterActionLabel("command:references", "references")
 	config.RegisterActionLabel("command:rename", "rename")
 	config.RegisterActionLabel("command:lsprestart", "restart lsp")
+	config.RegisterActionLabel("command:lspquickfix", "quick fix")
 
 	config.TryBindKey("Alt-k", "command:hover", false)
 	config.TryBindKey("Alt-d", "command:definition", false)
 	config.TryBindKey("Alt-f", "command:format", false)
 	config.TryBindKey("Alt-r", "command:references", false)
 	config.TryBindKey("Ctrl-Space", "command:lspcompletion", false)
+	config.TryBindKey(quickFixKey, "command:lspquickfix", false)
 	config.TryBindKey("F2", "command-edit:rename ", false)
 
 	config.AddRuntimeFile("lsp", config.RTHelp, "help/lsp.md")
@@ -1581,7 +1660,9 @@ function onStdout(filetype)
 					local uri = data.params.uri
 					local diagnosticPath = diagnosticPathFromURI(uri)
 					local uriDiagnostics = {}
+					local codeActionDiagnostics = {}
 					diagnosticsByPath[diagnosticPath] = uriDiagnostics
+					codeActionDiagnosticsByPath[diagnosticPath] = codeActionDiagnostics
 					for _, diagnostic in ipairs(data.params.diagnostics) do
 						local type = buffer.MTInfo
 						if diagnostic.severity == 1 then
@@ -1593,7 +1674,9 @@ function onStdout(filetype)
 						local mend = buffer.Loc(diagnostic.range["end"].character, diagnostic.range["end"].line)
 
 						if not isIgnoredMessage(diagnostic.message) then
-							local msg = buffer.NewMessage("lsp", diagnostic.message, mstart, mend, type)
+							table.insert(codeActionDiagnostics, diagnostic)
+							local displayMessage = diagnosticMessageForDisplay(filetype, diagnostic.message)
+							local msg = buffer.NewMessage("lsp", displayMessage, mstart, mend, type)
 							table.insert(uriDiagnostics, msg)
 						end
 					end
@@ -1728,17 +1811,25 @@ local function sendDefinitionRequest(filetype, file, line, char, response)
 	})
 end
 
+local function sendTypeDefinitionRequest(filetype, file, line, char, response)
+	withSend(filetype)("textDocument/typeDefinition", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}}', file, line, char), false, {
+		method = "textDocument/typeDefinition",
+		response = response,
+	})
+end
+
 function definitionAction(bp)
 	local filetype = bp.Buf:FileType()
 	if cmd[filetype] == nil then return; end
 
-	micro.PushJump()
 	flushPendingDidChangeForBuf(bp.Buf)
 
 	local file = bp.Buf.AbsPath
 	local line = bp.Buf:GetActiveCursor().Y
 	local char = bp.Buf:GetActiveCursor().X
-	sendDefinitionRequest(filetype, file, line, char, definitionActionResponse)
+	sendDefinitionRequest(filetype, file, line, char, function (_, data)
+		jumpToDefinitionOrUsefulType(bp, filetype, file, line, char, data)
+	end)
 end
 
 function definitionActionResponse(bp, data)
@@ -1782,6 +1873,79 @@ local function definitionResultList(data)
 		return { results }
 	end
 	return results
+end
+
+local function definitionTargetDocAndRange(data)
+	local results = definitionResultList(data)
+	if results == nil or #results <= 0 then
+		return nil, nil
+	end
+
+	local target = results[1]
+	local uri = target.uri or target.targetUri
+	local range = target.range or target.targetSelectionRange
+	return diagnosticPathFromURI(uri), range
+end
+
+local function definitionTargetsInit(data)
+	local doc, range = definitionTargetDocAndRange(data)
+	if doc == nil or range == nil or range.start == nil then
+		return false
+	end
+
+	local line = readReferenceLine(doc, range.start.line, {})
+	local trimmed = line:match("^%s*(.-)%s*$") or ''
+	return trimmed:match("^def%s+__init__%s*%(") ~= nil or trimmed:match("^async%s+def%s+__init__%s*%(") ~= nil
+end
+
+local function classDefinitionResult(data)
+	local results = definitionResultList(data)
+	if results == nil or #results <= 0 then
+		return nil
+	end
+
+	local root = workspaceRoot()
+	local fallback = nil
+	local cache = {}
+	for _, target in ipairs(results) do
+		local uri = target.uri or target.targetUri
+		local range = target.range or target.targetSelectionRange
+		local doc = diagnosticPathFromURI(uri)
+		if doc ~= nil and range ~= nil and range.start ~= nil then
+			local line = readReferenceLine(doc, range.start.line, cache)
+			local trimmed = line:match("^%s*(.-)%s*$") or ''
+			if trimmed:match("^class%s+") ~= nil then
+				if fallback == nil then
+					fallback = target
+				end
+				if root ~= nil and root ~= '' and doc:sub(1, #root + 1) == root .. "/" then
+					return target
+				end
+			end
+		end
+	end
+
+	return fallback
+end
+
+function jumpToDefinitionOrUsefulType(bp, filetype, file, line, char, data)
+	if filetype == "python" and definitionTargetsInit(data) and capabilities[filetype] ~= nil and capabilities[filetype].typeDefinitionProvider then
+		sendTypeDefinitionRequest(filetype, file, line, char, function (_, typeData)
+			local classTarget = classDefinitionResult(typeData)
+			if classTarget ~= nil then
+				micro.PushJump()
+				definitionActionResponse(bp, { result = { classTarget } })
+				return
+			end
+
+			micro.PushJump()
+			definitionActionResponse(bp, data)
+		end)
+		return
+	end
+
+	micro.PushJump()
+	definitionActionResponse(bp, data)
 end
 
 local function definitionMatchesPosition(data, file, line, character)
@@ -2158,8 +2322,7 @@ function smartReferenceAction(bp)
 			referencesAction(originPane)
 			return
 		end
-		micro.PushJump()
-		definitionActionResponse(originPane, data)
+		jumpToDefinitionOrUsefulType(originPane, filetype, file, line, char, data)
 	end)
 end
 
@@ -2183,6 +2346,33 @@ function serializeAdditionalTextEdits(entry)
 		end
 	end
 	return '[' .. table.join(out, ',') .. ']'
+end
+
+local function completionDetail(entry)
+	if entry == nil then
+		return ''
+	end
+	if entry.detail ~= nil and entry.detail ~= '' then
+		return entry.detail
+	end
+	if entry.labelDetails ~= nil then
+		if entry.labelDetails.detail ~= nil and entry.labelDetails.detail ~= '' then
+			return entry.labelDetails.detail
+		end
+		if entry.labelDetails.description ~= nil and entry.labelDetails.description ~= '' then
+			return entry.labelDetails.description
+		end
+	end
+	return ''
+end
+
+local function completionDisplayLabel(entry, insert)
+	local label = entry.label or insert
+	local detail = completionDetail(entry)
+	if detail ~= '' and label:find(detail, 1, true) == nil then
+		label = label .. " - " .. detail
+	end
+	return label
 end
 
 function inferCompletionRange(bp, results)
@@ -2209,7 +2399,7 @@ function serializeCompletionItems(results)
 	local out = {}
 	for _, entry in ipairs(results) do
 		local insert = normalizeInsertText(entry)
-		local label = entry.label or insert
+		local label = completionDisplayLabel(entry, insert)
 		if insert ~= '' and label ~= '' then
 			table.insert(out, fmt.Sprintf('{"insert":"%s","label":"%s","additionalTextEdits":%s,"sortText":"%s","preselect":%s,"deprecated":%s}',
 				jsonEscape(insert),
@@ -2311,6 +2501,565 @@ function completionActionResponse(bp, data)
 	local start, ending = inferCompletionRange(bp, results)
 	local payload = serializeCompletionItems(results)
 	bp.Buf:ShowExternalCompletionsJSON(payload, start.X, start.Y, ending.X, ending.Y)
+end
+
+local function currentWordInfo(bp)
+	if bp == nil or bp.Buf == nil then
+		return nil
+	end
+
+	local cur = bp.Buf:GetActiveCursor()
+	local line = util.String(bp.Buf:LineBytes(cur.Y))
+	if line == '' then
+		return nil
+	end
+
+	local pos = math.max(1, math.min(#line, cur.X + 1))
+	if not isWordChar(line:sub(pos, pos)) and pos > 1 and isWordChar(line:sub(pos - 1, pos - 1)) then
+		pos = pos - 1
+	end
+	if not isWordChar(line:sub(pos, pos)) then
+		return nil
+	end
+
+	local startPos = pos
+	while startPos > 1 and isWordChar(line:sub(startPos - 1, startPos - 1)) do
+		startPos = startPos - 1
+	end
+
+	local endPos = pos
+	while endPos < #line and isWordChar(line:sub(endPos + 1, endPos + 1)) do
+		endPos = endPos + 1
+	end
+
+	return {
+		line = cur.Y,
+		start = startPos - 1,
+		finish = endPos,
+		text = line:sub(startPos, endPos),
+	}
+end
+
+local function diagnosticContainsCursor(msg, cur)
+	if msg == nil or cur == nil or msg.Start == nil or msg.End == nil then
+		return false
+	end
+	local startY = math.min(msg.Start.Y, msg.End.Y)
+	local endY = math.max(msg.Start.Y, msg.End.Y)
+	if cur.Y < startY or cur.Y > endY then
+		return false
+	end
+	if msg.Start.Y == msg.End.Y then
+		local startX = math.min(msg.Start.X, msg.End.X)
+		local endX = math.max(msg.Start.X, msg.End.X)
+		if startX < 0 or endX <= startX then
+			return cur.Y == msg.Start.Y
+		end
+		return cur.X >= startX and cur.X < endX
+	end
+	return true
+end
+
+local function diagnosticContainsLine(msg, line)
+	if msg == nil or msg.Start == nil or msg.End == nil or line == nil then
+		return false
+	end
+	local startY = math.min(msg.Start.Y, msg.End.Y)
+	local endY = math.max(msg.Start.Y, msg.End.Y)
+	return line >= startY and line <= endY
+end
+
+local function wordInfoForNameOnLine(bp, lineY, name, msg)
+	if bp == nil or bp.Buf == nil or lineY == nil or name == nil or name == '' then
+		return nil
+	end
+
+	local line = util.String(bp.Buf:LineBytes(lineY))
+	if line == '' then
+		return nil
+	end
+
+	if msg ~= nil and msg.Start ~= nil and msg.End ~= nil and msg.Start.Y == lineY and msg.End.Y == lineY then
+		local startX = math.min(msg.Start.X, msg.End.X)
+		local endX = math.max(msg.Start.X, msg.End.X)
+		if startX >= 0 and endX > startX and line:sub(startX + 1, endX) == name then
+			return {
+				line = lineY,
+				start = startX,
+				finish = endX,
+				text = name,
+			}
+		end
+	end
+
+	local searchFrom = 1
+	while searchFrom <= #line do
+		local startPos, endPos = line:find(name, searchFrom, true)
+		if startPos == nil then
+			break
+		end
+		local before = startPos > 1 and line:sub(startPos - 1, startPos - 1) or ''
+		local after = endPos < #line and line:sub(endPos + 1, endPos + 1) or ''
+		if not isWordChar(before) and not isWordChar(after) then
+			return {
+				line = lineY,
+				start = startPos - 1,
+				finish = endPos,
+				text = name,
+			}
+		end
+		searchFrom = endPos + 1
+	end
+
+	return nil
+end
+
+local function currentMissingName(bp)
+	local word = currentWordInfo(bp)
+	local msgs = diagnosticsByPath[diagnosticPathFromBuf(bp.Buf)] or {}
+	local cur = bp.Buf:GetActiveCursor()
+
+	for _, msg in ipairs(msgs) do
+		local name = missingNameFromDiagnostic(msg.Msg)
+		if word ~= nil and name == word.text and diagnosticContainsLine(msg, word.line) then
+			return name, word
+		end
+	end
+
+	for _, msg in ipairs(msgs) do
+		local name = missingNameFromDiagnostic(msg.Msg)
+		if name ~= nil and diagnosticContainsLine(msg, cur.Y) then
+			local diagnosticWord = wordInfoForNameOnLine(bp, cur.Y, name, msg)
+			if diagnosticWord ~= nil then
+				return name, diagnosticWord
+			end
+		end
+	end
+
+	return nil, word
+end
+
+local function hasAdditionalTextEdits(entry)
+	return entry ~= nil and entry.additionalTextEdits ~= nil and #entry.additionalTextEdits > 0
+end
+
+local function autoImportCandidate(entry, name)
+	if not hasAdditionalTextEdits(entry) then
+		return false
+	end
+	local insert = normalizeInsertText(entry)
+	return insert == name or entry.label == name
+end
+
+local function autoImportNameCandidates(results, name)
+	local candidates = {}
+	for _, entry in ipairs(results or {}) do
+		local insert = normalizeInsertText(entry)
+		if insert == name or entry.label == name then
+			table.insert(candidates, entry)
+		end
+	end
+	return candidates
+end
+
+local function autoImportCandidates(results, name)
+	local candidates = {}
+	for _, entry in ipairs(results or {}) do
+		if autoImportCandidate(entry, name) then
+			table.insert(candidates, entry)
+		end
+	end
+	return candidates
+end
+
+local function completionResolveSupported(filetype)
+	local provider = capabilities[filetype] and capabilities[filetype].completionProvider
+	return provider ~= nil and provider.resolveProvider == true
+end
+
+local function jsonEncodeValue(value)
+	local valueType = type(value)
+	if value == nil then
+		return "null"
+	elseif valueType == "string" then
+		return jsonQuote(value)
+	elseif valueType == "number" or valueType == "boolean" then
+		return tostring(value)
+	elseif valueType ~= "table" then
+		return "null"
+	end
+
+	local isArray = true
+	local maxIndex = 0
+	for key, _ in pairs(value) do
+		if type(key) ~= "number" or key < 1 or math.floor(key) ~= key then
+			isArray = false
+			break
+		end
+		if key > maxIndex then
+			maxIndex = key
+		end
+	end
+
+	local out = {}
+	if isArray then
+		for idx = 1, maxIndex do
+			table.insert(out, jsonEncodeValue(value[idx]))
+		end
+		return "[" .. table.join(out, ",") .. "]"
+	end
+
+	for key, item in pairs(value) do
+		local itemType = type(item)
+		if type(key) == "string" and itemType ~= "function" and itemType ~= "userdata" and itemType ~= "thread" then
+			table.insert(out, jsonQuote(key) .. ":" .. jsonEncodeValue(item))
+		end
+	end
+	return "{" .. table.join(out, ",") .. "}"
+end
+
+local function resolveAutoImportCandidates(filetype, candidates, done)
+	if not completionResolveSupported(filetype) then
+		done(candidates)
+		return
+	end
+
+	local unresolved = {}
+	for idx, entry in ipairs(candidates) do
+		if not hasAdditionalTextEdits(entry) and entry.data ~= nil then
+			table.insert(unresolved, { index = idx, entry = entry })
+		end
+	end
+	if #unresolved == 0 then
+		done(candidates)
+		return
+	end
+
+	local remaining = #unresolved
+	local send = withSend(filetype)
+	for _, item in ipairs(unresolved) do
+		send("completionItem/resolve", jsonEncodeValue(item.entry), false, {
+			method = "completionItem/resolve",
+			response = function (_, data)
+				if data ~= nil and data.result ~= nil then
+					candidates[item.index] = data.result
+				end
+				remaining = remaining - 1
+				if remaining == 0 then
+					done(candidates)
+				end
+			end,
+		})
+	end
+end
+
+local function mainTextEditForCompletion(entry, word)
+	local insert = normalizeInsertText(entry)
+	if entry.textEdit ~= nil and entry.textEdit.range ~= nil then
+		return {
+			newText = insert,
+			range = entry.textEdit.range,
+		}
+	end
+	if insert ~= '' and insert ~= word.text then
+		return {
+			newText = insert,
+			range = {
+				start = { line = word.line, character = word.start },
+				["end"] = { line = word.line, character = word.finish },
+			},
+		}
+	end
+	return nil
+end
+
+local function applyAutoImportCompletion(bp, entry, word)
+	local edits = {}
+	for _, edit in ipairs(entry.additionalTextEdits or {}) do
+		table.insert(edits, edit)
+	end
+	local mainEdit = mainTextEditForCompletion(entry, word)
+	if mainEdit ~= nil then
+		table.insert(edits, mainEdit)
+	end
+	if #edits == 0 then
+		errorMessage("autoimport", "Auto-import: completion did not include an import edit")
+		return
+	end
+	applyTextEdits(bp, edits)
+	infoMessage("autoimport", "Auto-imported " .. word.text)
+end
+
+local function showAutoImportPicker(bp, candidates, word)
+	local payload = serializeCompletionItems(candidates)
+	local ok = bp.Buf:ShowExternalCompletionsJSON(payload, word.start, word.line, word.finish, word.line)
+	if not ok then
+		errorMessage("autoimport", "Auto-import: could not show import choices")
+		return
+	end
+	bp.Buf:CycleCompletionMenu(true)
+end
+
+local function finishAutoImport(bp, name, word, candidates, onFallback, showErrors)
+	candidates = autoImportCandidates(candidates, name)
+	traceLog("AUTOIMPORT_CANDIDATES", name, #candidates)
+	if #candidates == 0 then
+		if onFallback ~= nil then
+			onFallback()
+		elseif showErrors then
+			errorMessage("autoimport", "Auto-import: no import completion for " .. name)
+		end
+		return
+	end
+	if #candidates == 1 then
+		applyAutoImportCompletion(bp, candidates[1], word)
+		return
+	end
+	showAutoImportPicker(bp, candidates, word)
+end
+
+local function autoImportCompletionResponse(bp, filetype, name, word, data, onFallback, showErrors)
+	local results = data ~= nil and data.result or nil
+	if results == nil then
+		if onFallback ~= nil then
+			onFallback()
+		elseif showErrors then
+			errorMessage("autoimport", "Auto-import: no completion response from LSP")
+		end
+		return
+	end
+	if results.items then
+		results = results.items
+	end
+
+	local candidates = autoImportNameCandidates(results, name)
+	traceLog("AUTOIMPORT_NAME_CANDIDATES", name, #candidates)
+	if #candidates == 0 then
+		if onFallback ~= nil then
+			onFallback()
+		elseif showErrors then
+			errorMessage("autoimport", "Auto-import: no completion for " .. name)
+		end
+		return
+	end
+	resolveAutoImportCandidates(filetype, candidates, function(resolvedCandidates)
+		finishAutoImport(bp, name, word, resolvedCandidates, onFallback, showErrors)
+	end)
+end
+
+local function requestAutoImport(bp, filetype, name, word, onFallback, showErrors)
+	flushPendingDidChangeForBuf(bp.Buf)
+	local send = withSend(filetype)
+	local file = bp.Buf.AbsPath
+	bp.Cursor:GotoLoc(buffer.Loc(word.finish, word.line))
+	traceLog("AUTOIMPORT_REQUEST", filetype, file, name, word.line, word.finish)
+	send("textDocument/completion", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "position": {"line": %.0f, "character": %.0f}, "context": {"triggerKind": 1}}', file, word.line, word.finish), false, {
+		method = "textDocument/completion",
+		response = function (_, data)
+			autoImportCompletionResponse(bp, filetype, name, word, data, onFallback, showErrors)
+		end,
+	})
+end
+
+function autoImportAction(bp)
+	if bp == nil or bp.Buf == nil then
+		return
+	end
+	local filetype = bp.Buf:FileType()
+	if cmd[filetype] == nil then return; end
+	if filetype ~= "python" then
+		errorMessage("autoimport", "Auto-import is only enabled for Python buffers")
+		return
+	end
+
+	local name, word = currentMissingName(bp)
+	if name == nil then
+		errorMessage("autoimport", "Auto-import: put the cursor on a missing-name diagnostic")
+		return
+	end
+
+	requestAutoImport(bp, filetype, name, word, nil, true)
+end
+
+local function lspRangeContainsCursor(range, cur)
+	if range == nil or range.start == nil or range["end"] == nil or cur == nil then
+		return false
+	end
+	if cur.Y < range.start.line or cur.Y > range["end"].line then
+		return false
+	end
+	if cur.Y == range.start.line and cur.X < range.start.character then
+		return false
+	end
+	if cur.Y == range["end"].line and cur.X >= range["end"].character then
+		return false
+	end
+	return true
+end
+
+local function lspRangeContainsLine(range, line)
+	if range == nil or range.start == nil or range["end"] == nil or line == nil then
+		return false
+	end
+	return line >= range.start.line and line <= range["end"].line
+end
+
+local function currentCodeActionDiagnostics(bp)
+	local diagnostics = codeActionDiagnosticsByPath[diagnosticPathFromBuf(bp.Buf)] or {}
+	local cur = bp.Buf:GetActiveCursor()
+	local underCursor = {}
+	local onLine = {}
+
+	for _, diagnostic in ipairs(diagnostics) do
+		if lspRangeContainsCursor(diagnostic.range, cur) then
+			table.insert(underCursor, diagnostic)
+		elseif lspRangeContainsLine(diagnostic.range, cur.Y) then
+			table.insert(onLine, diagnostic)
+		end
+	end
+
+	if #underCursor > 0 then
+		return underCursor
+	end
+	return onLine
+end
+
+local function rangeForCodeAction(bp, diagnostics)
+	if diagnostics ~= nil and #diagnostics > 0 and diagnostics[1].range ~= nil then
+		return diagnostics[1].range
+	end
+	local cur = bp.Buf:GetActiveCursor()
+	return {
+		start = { line = cur.Y, character = cur.X },
+		["end"] = { line = cur.Y, character = cur.X },
+	}
+end
+
+local function serializeActionEdits(edits)
+	local out = {}
+	for _, edit in ipairs(edits or {}) do
+		if edit.range and edit.range.start and edit.range["end"] then
+			table.insert(out, fmt.Sprintf('{"text":"%s","start":{"x":%.0f,"y":%.0f},"end":{"x":%.0f,"y":%.0f}}',
+				jsonEscape(edit.newText or ''),
+				edit.range.start.character,
+				edit.range.start.line,
+				edit.range["end"].character,
+				edit.range["end"].line))
+		end
+	end
+	return "[" .. table.join(out, ",") .. "]"
+end
+
+local function workspaceEditEditsForCurrentDocument(edit, currentUri)
+	if edit == nil then
+		return nil
+	end
+
+	if edit.changes ~= nil then
+		for uri, edits in pairs(edit.changes) do
+			if uri == currentUri or diagnosticPathFromURI(uri) == diagnosticPathFromURI(currentUri) then
+				return edits
+			end
+		end
+	end
+
+	if edit.documentChanges ~= nil then
+		for _, change in ipairs(edit.documentChanges) do
+			if change.textDocument ~= nil and change.textDocument.uri ~= nil and change.edits ~= nil then
+				local uri = change.textDocument.uri
+				if uri == currentUri or diagnosticPathFromURI(uri) == diagnosticPathFromURI(currentUri) then
+					return change.edits
+				end
+			end
+		end
+	end
+
+	return nil
+end
+
+local function codeActionSortText(action, idx)
+	local kind = action.kind or ""
+	local bucket = "2"
+	if kind == "quickfix" or kind:starts("quickfix.") then
+		bucket = "0"
+	elseif kind:starts("refactor") then
+		bucket = "1"
+	elseif kind:starts("source") then
+		bucket = "3"
+	end
+	return bucket .. fmt.Sprintf("%04.0f", idx)
+end
+
+local function serializeCodeActionsForCurrentDocument(actions, currentUri)
+	local out = {}
+	for idx, action in ipairs(actions or {}) do
+		local title = action.title
+		local edits = workspaceEditEditsForCurrentDocument(action.edit, currentUri)
+		if title ~= nil and title ~= "" and edits ~= nil and #edits > 0 then
+			table.insert(out, fmt.Sprintf('{"insert":"%s","label":"%s","additionalTextEdits":%s,"sortText":"%s","preselect":%s,"deprecated":false,"noMainEdit":true}',
+				jsonEscape(title),
+				jsonEscape(title),
+				serializeActionEdits(edits),
+				jsonEscape(codeActionSortText(action, idx)),
+				idx == 1 and "true" or "false"))
+		end
+	end
+	return "[" .. table.join(out, ",") .. "]", #out
+end
+
+local function codeActionResponse(bp, data)
+	if data == nil or data.result == nil then
+		errorMessage("quickfix", "No quick fixes")
+		return
+	end
+
+	local payload, count = serializeCodeActionsForCurrentDocument(data.result, getUriFromBuf(bp.Buf))
+	if count == 0 then
+		errorMessage("quickfix", "No applicable quick fixes")
+		return
+	end
+
+	local cur = bp.Buf:GetActiveCursor()
+	if not bp.Buf:ShowExternalActionsJSON(payload, cur.X, cur.Y) then
+		errorMessage("quickfix", "Could not show quick fixes")
+	end
+end
+
+local function requestCodeActions(bp, filetype)
+	flushPendingDidChangeForBuf(bp.Buf)
+	local diagnostics = currentCodeActionDiagnostics(bp)
+	local requestRange = rangeForCodeAction(bp, diagnostics)
+	local file = bp.Buf.AbsPath
+	traceLog("CODE_ACTION_REQUEST", filetype, file, #diagnostics)
+	withSend(filetype)("textDocument/codeAction", fmt.Sprintf('{"textDocument": {"uri": "file://%s"}, "range": %s, "context": {"diagnostics": %s}}',
+		file,
+		jsonEncodeValue(requestRange),
+		jsonEncodeValue(diagnostics)), false, {
+		method = "textDocument/codeAction",
+		response = function (_, data)
+			codeActionResponse(bp, data)
+		end,
+	})
+end
+
+function quickFixAction(bp)
+	if bp == nil or bp.Buf == nil then
+		return
+	end
+	local filetype = bp.Buf:FileType()
+	if cmd[filetype] == nil then return; end
+
+	if filetype == "python" then
+		local name, word = currentMissingName(bp)
+		if name ~= nil then
+			requestAutoImport(bp, filetype, name, word, function()
+				requestCodeActions(bp, filetype)
+			end, false)
+			return
+		end
+	end
+
+	requestCodeActions(bp, filetype)
 end
 
 function formatAction(bp, callback)
